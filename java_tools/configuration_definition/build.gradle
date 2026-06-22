@@ -1,0 +1,41 @@
+plugins {
+    id 'java-library'
+    id 'com.gradleup.shadow' version "${shadowVersion}"
+    id 'antlr'
+}
+
+apply from: '../../java_tools/dependencies.gradle'
+
+defaultTasks 'shadowJar'
+
+dependencies {
+    implementation project(':inifile')
+    implementation project(':enum_to_string')
+    implementation project(':util')
+    implementation project(':trigger')
+
+    antlr global_libs.antlr
+    implementation global_libs.snakeyaml
+}
+
+tasks.named('shadowJar').configure {
+    archiveBaseName.set('ConfigDefinition')
+    archiveClassifier.set('')
+    destinationDirectory.set(file("${rootDir}"))
+
+    manifest {
+        attributes 'Main-Class': 'com.rusefi.ConfigDefinition'
+    }
+
+    // icu4j is huge, exclude it
+    dependencies {
+        exclude(dependency('com.ibm.icu:icu4j:.*'))
+    }
+}
+
+test {
+	testLogging {
+		events "failed"
+		exceptionFormat = "full"
+	}
+}

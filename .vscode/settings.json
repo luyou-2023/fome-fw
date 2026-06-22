@@ -1,0 +1,35 @@
+{
+	"editor.detectIndentation": false,
+	"editor.indentSize": 4,
+	"editor.tabSize": 4,
+	"editor.insertSpaces": false,
+	"[java]": {
+		"editor.insertSpaces": true
+	},
+	"files.exclude": {
+		"**/.dep": true,
+		"**/build/lst": true,
+		"**/build/obj": true,
+	},
+	"search.exclude": {
+		"**/.dep": true,
+		"**/build/lst": true,
+		"**/build/obj": true,
+		"firmware/ext/ChibiOS/demos": true,
+	},
+	"cSpell.words": [
+		"IACV"
+	],
+	"files.associations": {
+		"*.input": "ini"
+	},
+	"[c]": {
+		"editor.defaultFormatter": "ms-vscode.cpptools",
+		"editor.formatOnSave": true
+	},
+	"[cpp]": {
+		"editor.defaultFormatter": "ms-vscode.cpptools",
+		"editor.formatOnSave": true
+	},
+	"C_Cpp.clang_format_style": "file",
+}

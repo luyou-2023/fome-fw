@@ -1,0 +1,15 @@
+openocd
+benchmark.txt
+logs/
+deliver/
+rusefi_tool.log
+build*
+ramdisk.image
+
+# precompiled headers
+*.h.gch
+*.h.gcno
+
+# tools
+gcc-arm-none-eabi
+arm-gnu*

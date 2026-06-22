@@ -1,0 +1,85 @@
+/* [空气量模型基类]
+ * 提供气缸充气量计算的基础框架。子类实现具体的进气量估算策略（速度密度、MAF、Alpha-N），
+ * 本类负责 VE 表的查询与负载轴选择。
+ */
+
+#include "pch.h"
+
+#include "airmass.h"
+#include "idle_thread.h"
+
+AirmassVeModelBase::AirmassVeModelBase(const ValueProvider3D* veTable)
+	: m_veTable(veTable) {}
+
+static float getVeLoadAxis(ve_override_e mode, float passedLoad) {
+	switch (mode) {
+		case VE_None:
+			return passedLoad;
+		case VE_MAP:
+			return Sensor::getOrZero(SensorType::Map);
+		case VE_TPS:
+			return Sensor::getOrZero(SensorType::Tps1);
+		default:
+			return 0;
+	}
+}
+
+float AirmassVeModelBase::getVe(float rpm, float load, bool postState) const {
+	// Override the load value if necessary
+	load = getVeLoadAxis(engineConfiguration->veOverrideMode, load);
+
+	percent_t ve = m_veTable ? m_veTable->getValue(rpm, load) : getVeImpl(rpm, load);
+
+	float idleVeLoad = load;
+
+#if EFI_IDLE_CONTROL
+	auto tps = Sensor::get(SensorType::DriverThrottleIntent);
+	// get VE from the separate table for Idle if idling
+	if (engine->module<IdleController>()->isIdlingOrTaper() && tps && engineConfiguration->useSeparateVeForIdle) {
+		idleVeLoad = getVeLoadAxis(engineConfiguration->idleVeOverrideMode, load);
+
+		percent_t idleVe =
+				interpolate3d(config->idleVeTable, config->idleVeLoadBins, idleVeLoad, config->idleVeRpmBins, rpm);
+
+		// interpolate between idle table and normal (running) table using TPS threshold
+		// 0 TPS -> idle table
+		// 1/2 threshold -> idle table
+		// idle threshold -> normal table
+		float idleThreshold = engineConfiguration->idlePidDeactivationTpsThreshold;
+		ve = interpolateClamped(idleThreshold / 2, idleVe, idleThreshold, ve, tps.Value);
+	}
+#endif // EFI_IDLE_CONTROL
+
+	// Add any adjustments if configured
+	for (size_t i = 0; i < efi::size(config->veBlends); i++) {
+		auto result = calculateBlend(config->veBlends[i], rpm, load);
+
+		if (postState) {
+			engine->outputChannels.veBlendParameter[i] = result.BlendParameter;
+			engine->outputChannels.veBlendBias[i] = result.Bias;
+			engine->outputChannels.veBlendOutput[i] = result.Value;
+			engine->outputChannels.veBlendYAxis[i] = result.TableYAxis;
+		}
+
+		// Skip extra floating point math if we can...
+		if (result.Value == 0) {
+			continue;
+		}
+
+		// Apply as a multiplier, not as an adder
+		// Value of +5 means add 5%, aka multiply by 1.05
+		ve *= ((100 + result.Value) * 0.01f);
+	}
+
+	if (postState) {
+		engine->engineState.currentVe = ve;
+		engine->engineState.veTableYAxis = load;
+		engine->engineState.idleVeTableYAxis = idleVeLoad;
+	}
+
+	return ve * PERCENT_DIV;
+}
+
+float AirmassVeModelBase::getVeImpl(float rpm, percent_t load) const {
+	return interpolate3d(config->veTable, config->veLoadBins, load, config->veRpmBins, rpm);
+}

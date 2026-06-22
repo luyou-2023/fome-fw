@@ -1,0 +1,11 @@
+build_hw
+logs/
+generated*.cpp
+currenttune.msq
+output.msq
+rusefi.ini
+openocd
+rusefi_*.*
+triggers
+unit_test*.xml
+*trace.json

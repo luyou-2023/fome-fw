@@ -1,0 +1,111 @@
+/**
+ * @file	This file implements CAN-to-TS bridge.
+ *
+ * @date Apr 24, 2021
+ * @author andreika <prometheus.pcb@gmail.com>
+ * @author Andrey Belomutskiy, (c) 2012-2021
+ */
+
+// [中文标题] ts_can_channel.cpp - TS CAN通道
+// 实现通过CAN总线传输TunerStudio协议，使用ISO-TP
+// 封装TS数据包，支持短包优化单帧传输。
+
+#include "pch.h"
+#include "tunerstudio.h"
+#include "tunerstudio_io.h"
+
+#if EFI_CAN_SERIAL
+#include "serial_can.h"
+#include "can_hw.h"
+
+#if !EFI_CAN_SUPPORT
+#error "EFI_CAN_SERIAL requires EFI_CAN_SUPPORT"
+#endif
+
+class CanTsChannel final : public TsChannelBase {
+public:
+	CanTsChannel()
+		: TsChannelBase("CAN") {}
+	void start();
+
+	// TsChannelBase implementation
+	void write(const uint8_t* buffer, size_t size, bool isEndOfPacket) override;
+	size_t readTimeout(uint8_t* buffer, size_t size, int timeout) override;
+	bool isReady() const override;
+	void stop() override;
+
+	// Special override for writeCrcPacket for small packets
+	void copyAndWriteSmallCrcPacket(const uint8_t* buf, size_t size) override;
+};
+
+void CanTsChannel::start() {
+	if (!getIsCanEnabled()) {
+		warning(ObdCode::CUSTOM_ERR_CAN_CONFIGURATION, "CAN not enabled");
+		return;
+	}
+
+	if (!engineConfiguration->canReadEnabled || !engineConfiguration->canWriteEnabled) {
+		warning(ObdCode::CUSTOM_ERR_CAN_CONFIGURATION, "CAN read or write not enabled");
+	}
+}
+
+void CanTsChannel::stop() {}
+
+void CanTsChannel::copyAndWriteSmallCrcPacket(const uint8_t* buf, size_t size) {
+#ifdef TS_CAN_DEVICE_SHORT_PACKETS_IN_ONE_FRAME
+	// a special case for short packets: we can send them in 1 frame, without CRC & size,
+	// because the CAN protocol is already protected by its own checksum.
+	if ((size + 1) <= 7) {
+		uint8_t responseCode = TS_RESPONSE_OK;
+		if (size > 0) {
+			write(&responseCode, 1, /*isEndOfPacket*/ false); // header without size
+			write(buf, size, /*isEndOfPacket*/ true);		  // body, terminate the frame
+		} else {
+			write(&responseCode, 1, /*isEndOfPacket*/ true);
+		}
+		return;
+	}
+#endif /* TS_CAN_DEVICE_SHORT_PACKETS_IN_ONE_FRAME */
+
+	// Packet too large, use default implementation
+	TsChannelBase::copyAndWriteSmallCrcPacket(buf, size);
+}
+
+void CanTsChannel::write(const uint8_t* buffer, size_t size, bool isEndOfPacket) {
+	canStreamAddToTxTimeout(&size, buffer, BINARY_IO_TIMEOUT);
+
+	if (isEndOfPacket) {
+		canStreamFlushTx(BINARY_IO_TIMEOUT);
+	}
+}
+
+size_t CanTsChannel::readTimeout(uint8_t* buffer, size_t size, int timeout) {
+	canStreamReceiveTimeout(&size, buffer, timeout);
+	return size;
+}
+
+bool CanTsChannel::isReady() const {
+	// this channel is always ready
+	return true;
+}
+
+static CanTsChannel canChannel;
+
+struct CanTsThread : public TunerstudioThread {
+	CanTsThread()
+		: TunerstudioThread("CAN TS Channel") {}
+
+	TsChannelBase* setupChannel() override {
+		canChannel.start();
+		return &canChannel;
+	}
+};
+
+static CanTsThread canTsThread;
+
+void startCanConsole() {
+	canTsThread.startThread();
+	canStreamInit();
+}
+
+#endif // EFI_CAN_SERIAL

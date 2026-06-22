@@ -1,0 +1,139 @@
+/**
+ * @file	efi_gpio.h
+ * @brief	EFI-related GPIO code
+ *
+ *
+ * @date Sep 26, 2014
+ * @author Andrey Belomutskiy, (c) 2012-2020
+ */
+
+#pragma once
+
+#include "global.h"
+#include "io_pins.h"
+#include "engine_configuration.h"
+#include "injection_gpio.h"
+
+void initPrimaryPins();
+void initOutputPins();
+void turnAllPinsOff();
+
+#ifdef __cplusplus
+
+class IgnitionOutputPin : public NamedOutputPin {};
+
+/**
+ * OutputPin with semi-automated init/deinit on configuration change
+ */
+class RegisteredOutputPin : public virtual OutputPin {
+public:
+	RegisteredOutputPin(const char* registrationName, size_t pinOffset, size_t pinModeOffset);
+	RegisteredOutputPin(const char* registrationName, size_t pinOffset);
+	void init();
+	void unregister();
+	RegisteredOutputPin* const next;
+	const char* getRegistrationName() const {
+		return m_registrationName;
+	}
+
+private:
+	const char* const m_registrationName;
+	const uint16_t m_pinOffset;
+	const bool m_hasPinMode;
+	const uint16_t m_pinModeOffset;
+	bool isPinConfigurationChanged();
+};
+class EnginePins {
+public:
+	EnginePins();
+	void startPins();
+	void reset();
+	static void debug();
+	bool stopPins();
+	void unregisterPins();
+	RegisteredOutputPin mainRelay;
+	/**
+	 * High Pressure Fuel Pump valve control
+	 */
+	RegisteredOutputPin hpfpValve;
+	// this one cranks engine
+	RegisteredOutputPin starterControl;
+	// this one prevents driver from cranking engine
+	RegisteredOutputPin starterRelayDisable;
+
+	RegisteredOutputPin fanRelay;
+	RegisteredOutputPin fanRelay2;
+
+	// see acRelayPin
+	RegisteredOutputPin acRelay;
+	RegisteredOutputPin fuelPumpRelay;
+	RegisteredOutputPin harleyAcr;
+	RegisteredOutputPin harleyAcr2;
+	OutputPin o2heater;
+	OutputPin luaOutputPins[LUA_PWM_COUNT];
+
+	/**
+	 * brain board RED LED by default
+	 */
+	OutputPin errorLedPin;
+	OutputPin communicationLedPin; // blue LED on brain board by default
+	OutputPin warningLedPin;	   // orange LED on brain board by default
+	OutputPin runningLedPin;	   // green LED on brain board by default
+
+	OutputPin debugTriggerSync;
+	RegisteredOutputPin boostPin;
+	RegisteredOutputPin idleSolenoidPin;
+	RegisteredOutputPin secondIdleSolenoidPin;
+	RegisteredOutputPin alternatorPin;
+	/**
+	 * this one is usually on the gauge cluster, not on the ECU
+	 */
+	RegisteredOutputPin checkEnginePin;
+
+	RegisteredOutputPin tachOut;
+	RegisteredOutputPin speedoOut;
+
+	OutputPin sdCsPin;
+	OutputPin accelerometerCs;
+
+	InjectorOutputPin injectors[MAX_CYLINDER_COUNT];
+	InjectorOutputPin injectorsStage2[MAX_CYLINDER_COUNT];
+	IgnitionOutputPin coils[MAX_CYLINDER_COUNT];
+	IgnitionOutputPin trailingCoils[MAX_CYLINDER_COUNT];
+
+private:
+	void startInjectionPins();
+	void startIgnitionPins();
+
+	void stopInjectionPins();
+	void stopIgnitionPins();
+};
+
+#endif /* __cplusplus */
+
+/**
+ * it's a macro to be sure that stack is not used
+ * @return 0 for OM_DEFAULT and OM_OPENDRAIN
+ */
+
+#define getElectricalValue0(mode) ((mode) == OM_INVERTED || (mode) == OM_OPENDRAIN_INVERTED)
+
+/**
+ * it's a macro to be sure that stack is not used
+ * @return 1 for OM_DEFAULT and OM_OPENDRAIN
+ */
+#define getElectricalValue1(mode) ((mode) == OM_DEFAULT || (mode) == OM_OPENDRAIN)
+
+#define getElectricalValue(logicalValue, mode) (logicalValue ? getElectricalValue1(mode) : getElectricalValue0(mode))
+
+ioportmask_t getHwPin(const char* msg, brain_pin_e brainPin);
+ioportid_t getHwPort(const char* msg, brain_pin_e brainPin);
+const char* portname(ioportid_t GPIOx);
+
+brain_pin_e parseBrainPin(const char* str);
+
+extern EnginePins enginePins;
+
+#ifndef LED_PIN_MODE
+#define LED_PIN_MODE OM_DEFAULT
+#endif /* LED_PIN_MODE */

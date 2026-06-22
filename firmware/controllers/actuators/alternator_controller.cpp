@@ -1,0 +1,91 @@
+/**
+ * @file    alternator_controller.cpp
+ * [发电机控制]
+ * 通过控制发电机励磁电流调节充电电压。
+ * 使用PID闭环: 目标电压(通常14.0-14.5V) → PWM占空比 → 励磁电流 → 发电电压。
+ *
+ * 作用: 1) 稳定电压供应  2) 根据负载调整发电功率  3) 减少发动机负载(负荷时降低发电)
+ *
+ * @brief   alternator controller - some newer vehicles control alternator with ECU
+ * @date Apr 6, 2014
+ * @author Dmitry Sidin
+ * @author Andrey Belomutskiy, (c) 2012-2020
+ */
+
+#include "pch.h"
+
+#if EFI_ALTERNATOR_CONTROL
+#include "alternator_controller.h"
+#include "efi_pid.h"
+#include "local_version_holder.h"
+
+static SimplePwm alternatorControl("alt");
+static Pid alternatorPid(&persistentState.persistentConfiguration.engineConfiguration.alternatorControl);
+
+void AlternatorController::onFastCallback() {
+	if (!isBrainPinValid(engineConfiguration->alternatorControlPin)) {
+		return;
+	}
+
+	// this block could be executed even in on/off alternator control mode
+	// but at least we would reflect latest state
+#if EFI_TUNER_STUDIO
+	alternatorPid.postState(engine->outputChannels.alternatorStatus);
+#endif /* EFI_TUNER_STUDIO */
+
+	update();
+}
+
+expected<float> AlternatorController::getSetpoint() {
+	bool alternatorShouldBeEnabledAtCurrentRpm = Sensor::getOrZero(SensorType::Rpm) > engineConfiguration->cranking.rpm;
+
+	if (!engineConfiguration->isAlternatorControlEnabled || !alternatorShouldBeEnabledAtCurrentRpm) {
+		return unexpected;
+	}
+
+	return engineConfiguration->targetVBatt;
+}
+
+expected<float> AlternatorController::observePlant() const {
+	return Sensor::get(SensorType::BatteryVoltage);
+}
+
+expected<percent_t> AlternatorController::getOpenLoop(float /*target*/) {
+	// TODO: table lookup base open loop value
+	return 0;
+}
+
+expected<percent_t> AlternatorController::getClosedLoop(float setpoint, float observation) {
+	return alternatorPid.getOutput(setpoint, observation, FAST_CALLBACK_PERIOD_MS / 1000.0f);
+}
+
+void AlternatorController::setOutput(expected<percent_t> outputValue) {
+	if (outputValue) {
+		alternatorControl.setSimplePwmDutyCycle(PERCENT_TO_DUTY(outputValue.Value));
+	} else {
+		// turn off in case of fault and reset
+		alternatorPid.reset();
+		alternatorControl.setSimplePwmDutyCycle(0);
+	}
+}
+
+void AlternatorController::onConfigurationChange(engine_configuration_s const* previousConfiguration) {
+	if (!previousConfiguration || !alternatorPid.isSame(&previousConfiguration->alternatorControl)) {
+		alternatorPid.reset();
+	}
+}
+
+void initAlternatorCtrl() {
+	if (!isBrainPinValid(engineConfiguration->alternatorControlPin)) {
+		return;
+	}
+
+	startSimplePwm(
+			&alternatorControl,
+			"Alternator control",
+			&enginePins.alternatorPin,
+			engineConfiguration->alternatorPwmFrequency,
+			0);
+}
+
+#endif /* EFI_ALTERNATOR_CONTROL */

@@ -1,0 +1,121 @@
+
+/* [减速断油]
+ * DFCO（Deceleration Fuel Cut Off）控制器。在驾驶员松开油门且发动机转速
+ * 高于设定阈值时切断燃油供给，以提高燃油经济性并减少排放。
+ */
+
+#include "pch.h"
+#include "engine_configuration.h"
+#include "sensor.h"
+#include "rusefi/interpolation.h"
+
+#include "dfco.h"
+
+bool DfcoController::getState() const {
+	if (!engineConfiguration->coastingFuelCutEnabled) {
+		return false;
+	}
+
+	const auto tps = Sensor::get(SensorType::DriverThrottleIntent);
+	const auto clt = Sensor::get(SensorType::Clt);
+	const auto map = Sensor::get(SensorType::Map);
+
+	// If some sensor is broken, inhibit DFCO
+	if (!tps || !clt) {
+		return false;
+	}
+
+	// MAP sensor is optional, only inhibit if the sensor is present but broken
+	bool hasMap = Sensor::hasSensor(SensorType::Map);
+	if (hasMap && !map) {
+		return false;
+	}
+
+	float rpm = Sensor::getOrZero(SensorType::Rpm);
+	float vss = Sensor::getOrZero(SensorType::VehicleSpeed);
+
+	// Setting to allow clutch to block DFCO activation
+	bool clutchActivate = !engineConfiguration->disableFuelCutOnClutch ||
+						  !isBrainPinValid(engineConfiguration->clutchUpPin) || engine->engineState.clutchUpState;
+
+	float mapThreshold = engineConfiguration->useTableForDfcoMap
+							   ? interpolate2d(rpm, config->dfcoMapRpmValuesBins, config->dfcoMapRpmValues)
+							   : engineConfiguration->coastingFuelCutMap;
+
+	bool mapActivate = !hasMap || !m_mapHysteresis.test(map.value_or(0), mapThreshold + 1, mapThreshold - 1);
+	bool tpsActivate = tps.Value < engineConfiguration->coastingFuelCutTps;
+	bool cltActivate = clt.Value > engineConfiguration->coastingFuelCutClt;
+	// True if throttle, MAP, CLT, and Clutch are all acceptable for DFCO to occur
+	bool dfcoAllowed = mapActivate && tpsActivate && cltActivate && clutchActivate;
+
+	bool rpmHigh = (rpm > engineConfiguration->coastingFuelCutRpmHigh);
+	bool rpmLow = (rpm < engineConfiguration->coastingFuelCutRpmLow);
+
+	// Ignore if either is set to 0kph
+	bool disableVssCheck =
+			(engineConfiguration->coastingFuelCutVssHigh == 0) || (engineConfiguration->coastingFuelCutVssLow == 0);
+	// true if disabled
+	bool vssHigh = disableVssCheck || (vss >= engineConfiguration->coastingFuelCutVssHigh);
+	// false if disabled
+	bool vssLow = !disableVssCheck && (vss < engineConfiguration->coastingFuelCutVssLow);
+
+	// RPM is high enough, VSS high enough, and DFCO allowed
+	if (dfcoAllowed && rpmHigh && vssHigh) {
+		return true;
+	}
+
+	// RPM too low, VSS too low, or DFCO not allowed
+	if (!dfcoAllowed || rpmLow || vssLow) {
+		return false;
+	}
+
+	// No conditions hit, no change to state (provides hysteresis)
+	return m_isDfco;
+}
+
+void DfcoController::update() {
+	// Run state machine
+	bool newState = getState();
+
+	// If fuel is cut, reset the timer
+	if (newState) {
+		m_timeSinceCut.reset();
+	} else {
+		// If fuel is not cut, reset the not-cut timer
+		m_timeSinceNoCut.reset();
+	}
+
+	m_isDfco = newState;
+}
+
+bool DfcoController::cutFuel() const {
+	float cutDelay = engineConfiguration->dfcoDelay;
+
+	// 0 delay means cut immediately, aka timer has always expired
+	bool hasBeenDelay = (cutDelay == 0) || m_timeSinceNoCut.hasElapsedSec(cutDelay);
+
+	return m_isDfco && hasBeenDelay;
+}
+
+float DfcoController::getTimeSinceCut() const {
+	return m_timeSinceCut.getElapsedSeconds();
+}
+
+float DfcoController::getTimingRetard() const {
+	float cutTiming = clampF(0, engineConfiguration->dfcoRetardDeg, 30);
+
+	if (m_isDfco) {
+		// While cut, always retard timing
+		return cutTiming;
+	} else {
+		float timeSinceCut = m_timeSinceCut.getElapsedSeconds();
+		float rampInTime = engineConfiguration->dfcoRetardRampInTime;
+
+		if (timeSinceCut > rampInTime) {
+			// Normal operation, no retard
+			return 0;
+		} else {
+			return interpolateClamped(0, cutTiming, 0.5, 0, timeSinceCut);
+		}
+	}
+}

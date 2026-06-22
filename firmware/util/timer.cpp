@@ -1,0 +1,106 @@
+// [中文标题] timer.cpp
+// 通用定时器实现：提供一次性/循环定时功能
+
+#include "pch.h"
+
+#include "efi_timer.h"
+
+#include <atomic>
+
+Timer::Timer() {
+	init();
+}
+
+void Timer::reset() {
+	m_lastReset.set(getTimeNowNt());
+}
+
+void Timer::init() {
+	// Use not-quite-minimum value to avoid overflow
+	m_lastReset.set(INT64_MIN / 8);
+}
+
+void Timer::reset(efitick_t nowNt) {
+	m_lastReset.set(nowNt);
+}
+
+void Timer::TearSafeResetTime::set(efitick_t value) {
+	m_value = value;
+}
+
+efitick_t Timer::TearSafeResetTime::get() const {
+	// Read twice and retry until two consecutive reads agree, defending against
+	// a writer tearing the 64-bit value mid-store. The compiler barriers prevent
+	// the two reads from being coalesced into one.
+	efitick_t a = m_value;
+	while (true) {
+		std::atomic_signal_fence(std::memory_order_acq_rel);
+		efitick_t b = m_value;
+		if (a == b) {
+			return a;
+		}
+		a = b;
+	}
+}
+
+bool Timer::hasElapsedSec(float seconds) const {
+	return hasElapsedMs(seconds * 1000);
+}
+
+bool Timer::hasElapsedMs(float milliseconds) const {
+	return hasElapsedUs(milliseconds * 1000);
+}
+
+static const efidur_t clock32max = efidur_t{UINT32_MAX - 1};
+
+bool Timer::hasElapsedUs(float microseconds) const {
+	auto delta = getTimeNowNt() - m_lastReset.get();
+
+	// If larger than 32 bits, timer has certainly expired
+	if (delta >= clock32max) {
+		return true;
+	}
+
+	auto delta32 = (uint32_t)delta;
+
+	return delta32 > USF2NT(microseconds);
+}
+
+float Timer::getElapsedSeconds() const {
+	return getElapsedSeconds(getTimeNowNt());
+}
+
+float Timer::getElapsedSeconds(efitick_t nowNt) const {
+	return 1 / US_PER_SECOND_F * getElapsedUs(nowNt);
+}
+
+float Timer::getElapsedUs() const {
+	return getElapsedUs(getTimeNowNt());
+}
+
+float Timer::getElapsedUs(efitick_t nowNt) const {
+	auto deltaNt = nowNt - m_lastReset.get();
+
+	// Yes, things can happen slightly in the future if we get a lucky interrupt between
+	// the timestamp and this subtraction, that updates m_lastReset to what's now "the future",
+	// resulting in a negative delta.
+	if (deltaNt < 0) {
+		return 0;
+	}
+
+	if (deltaNt > clock32max) {
+		deltaNt = clock32max;
+	}
+
+	auto delta32 = (uint32_t)deltaNt;
+
+	return NT2US(delta32);
+}
+
+float Timer::getElapsedSecondsAndReset(efitick_t nowNt) {
+	float result = getElapsedSeconds(nowNt);
+
+	reset(nowNt);
+
+	return result;
+}

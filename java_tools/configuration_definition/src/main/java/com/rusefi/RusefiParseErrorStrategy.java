@@ -1,0 +1,68 @@
+package com.rusefi;
+
+import com.rusefi.generated.RusefiConfigGrammarLexer;
+import com.rusefi.generated.RusefiConfigGrammarParser;
+import org.antlr.v4.runtime.*;
+import org.antlr.v4.runtime.tree.ParseTree;
+import org.antlr.v4.runtime.tree.ParseTreeListener;
+import org.antlr.v4.runtime.tree.ParseTreeWalker;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
+public class RusefiParseErrorStrategy extends DefaultErrorStrategy {
+    private boolean hadError = false;
+
+    public static void parseDefinitionFile(ParseTreeListener listener, String filePath) throws IOException {
+        CharStream in = CharStreams.fromPath(Paths.get(filePath));
+
+        long start = System.nanoTime();
+        parse(listener, in);
+        double durationMs = (System.nanoTime() - start) / 1e6;
+
+        System.out.printf("Parsed %s in %.2f ms\n", filePath, durationMs);
+    }
+
+    public static void parseDefinitionString(ParseTreeListener listener, String content) {
+        CharStream in = CharStreams.fromString(content);
+
+        long start = System.nanoTime();
+        parse(listener, in);
+        double durationMs = (System.nanoTime() - start) / 1e6;
+
+        System.out.printf("Parsed input string in %.2f ms\n", durationMs);
+    }
+
+    private static void parse(ParseTreeListener listener, CharStream in) {
+        RusefiConfigGrammarParser parser = new RusefiConfigGrammarParser(new CommonTokenStream(new RusefiConfigGrammarLexer(in)));
+
+        RusefiParseErrorStrategy errorStrategy = new RusefiParseErrorStrategy();
+        parser.setErrorHandler(errorStrategy);
+
+        ParseTree tree = parser.content();
+        new ParseTreeWalker().walk(listener, tree);
+
+        if (errorStrategy.hadError()) {
+            throw new RuntimeException("Parse failed, see error output above!");
+        }
+    }
+
+    public boolean hadError() {
+        return this.hadError;
+    }
+
+    @Override
+    public void recover(Parser recognizer, RecognitionException e) {
+        this.hadError = true;
+
+        super.recover(recognizer, e);
+    }
+
+    @Override
+    public Token recoverInline(Parser recognizer) throws RecognitionException {
+        this.hadError = true;
+
+        return super.recoverInline(recognizer);
+    }
+}

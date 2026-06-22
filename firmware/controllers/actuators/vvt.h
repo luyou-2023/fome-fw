@@ -1,0 +1,81 @@
+/*
+ * @file vvt.h
+ *
+ * @date Jun 26, 2016
+ * @author Andrey Belomutskiy, (c) 2012-2020
+ */
+
+#pragma once
+
+#include "closed_loop_controller.h"
+#include "pwm_generator_logic.h"
+#include "efi_pid.h"
+#include "vvt_generated.h"
+
+class ValueProvider3D;
+
+void initVvtActuators();
+void startVvtControlPins();
+void stopVvtControlPins();
+
+class VvtController : public EngineModule, public ClosedLoopController<angle_t, percent_t>, public vvt_s {
+public:
+	VvtController(int index, int bankIndex, int camIndex);
+
+	void init(const ValueProvider3D* targetMap, IPwm* pwm);
+	void setTargetOffset(float targetOffset);
+
+	// EngineModule implementation
+	void onFastCallback() override;
+	void onConfigurationChange(engine_configuration_s const* previousConfig) override;
+
+	// ClosedLoopController implementation
+	expected<angle_t> observePlant() const override;
+
+	expected<angle_t> getSetpoint() override;
+	expected<percent_t> getOpenLoop(angle_t target) override;
+	expected<percent_t> getClosedLoop(angle_t setpoint, angle_t observation) override;
+	void setOutput(expected<percent_t> outputValue) override;
+
+private:
+	const int m_index;
+	// Bank index, 0 or 1
+	const uint8_t m_bank;
+	// Cam index, 0 = intake, 1 = exhaust
+	const uint8_t m_cam;
+
+	Pid m_pid;
+	Timer m_timeSinceEnabled;
+
+	bool m_engineRunningLongEnough = false;
+	bool m_isRpmHighEnough = false;
+	bool m_isCltWarmEnough = false;
+
+	const ValueProvider3D* m_targetMap = nullptr;
+	Hysteresis m_targetHysteresis;
+	IPwm* m_pwm = nullptr;
+
+	Timer m_targetOffsetTimer;
+	float m_targetOffset;
+};
+
+// Unique types for each VVT so they can be engine modules
+struct VvtController1 : public VvtController {
+	VvtController1()
+		: VvtController(0, 0, 0) {}
+};
+
+struct VvtController2 : public VvtController {
+	VvtController2()
+		: VvtController(1, 0, 1) {}
+};
+
+struct VvtController3 : public VvtController {
+	VvtController3()
+		: VvtController(2, 1, 0) {}
+};
+
+struct VvtController4 : public VvtController {
+	VvtController4()
+		: VvtController(3, 1, 1) {}
+};

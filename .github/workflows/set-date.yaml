@@ -1,0 +1,47 @@
+name: Set Date
+
+# Run once every day
+# If we run it on schedule, but only change the date stamp if the repo has changed, The date could be behind by up to a day.
+# We can't really try to change it with every push the way workflows are set up now,
+#  because there is no way to control which workflows run first, so some builds will not have the updated date and will lag behind by one build.
+# https://help.github.com/en/actions/reference/events-that-trigger-workflows#triggering-new-workflows-using-a-personal-access-token
+#  "When you use the repository's GITHUB_TOKEN to perform tasks on behalf of the GitHub Actions app,
+#  events triggered by the GITHUB_TOKEN will not create a new workflow run."
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-date:
+    runs-on: ubuntu-latest-selfhost
+    if: ${{ github.repository == 'FOME-Tech/fome-fw' }}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Check last date
+      run: if [ "$(git log -1 --pretty=%B)" = "Update date" ]; then echo "skip=true" >> $GITHUB_ENV; fi
+
+    # - name: Install Tools
+    #   if: ${{ env.skip != 'true' }}
+    #   working-directory: ./.github/workflows/
+    #   run: |
+    #     sudo ./add-ubuntu-latest-apt-mirrors.sh
+    #     sudo apt-get install subversion
+
+    - name: Write Date File
+      if: ${{ env.skip != 'true' }}
+      run: |
+        echo -e -n "#pragma once\n#define VCS_DATE $(date "+%Y%m%d")\n" > ./firmware/controllers/date_stamp.h
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub set-date Action"
+        git add ./firmware/controllers/date_stamp.h
+        git commit -m "Update date" 2>&1 | grep -E '(nothing to commit|changed)'
+
+    - name: Push changed date file
+      if: ${{ env.skip != 'true' }}
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ github.token }}
+        branch: master

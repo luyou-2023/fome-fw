@@ -1,0 +1,86 @@
+/*
+ * @file antilag_system.cpp
+ *
+ *  @date 26. nov. 2022
+ *      Author: Turbo Marian
+ */
+
+/* [防滞后系统]
+ * ALS（Anti-Lag System）防滞后系统。在松油门或换挡时通过延迟点火和/或
+ * 额外供油保持排气温度，维持涡轮增压器转速以减少涡轮迟滞。
+ */
+
+#include "pch.h"
+
+#if EFI_ANTILAG_SYSTEM
+#include "antilag_system.h"
+#include "engine_state.h"
+#include "fuel_math.h"
+
+bool AntilagSystemBase::isInsideALSSwitchCondition() {
+	isALSSwitchActivated = engineConfiguration->antiLagActivationMode == SWITCH_INPUT_ANTILAG;
+
+	if (isALSSwitchActivated) {
+		if (isBrainPinValid(engineConfiguration->ALSActivatePin)) {
+#if EFI_PROD_CODE
+			ALSActivatePinState =
+					engineConfiguration->ALSActivateInverted ^ efiReadPin(engineConfiguration->ALSActivatePin);
+#else
+			ALSActivatePinState = false;
+#endif
+		}
+		return ALSActivatePinState;
+	} else {
+		// ALWAYS_ACTIVE_ANTILAG
+		return true;
+	}
+}
+
+bool AntilagSystemBase::isALSMinRPMCondition(float rpm) const {
+	return engineConfiguration->ALSMinRPM < rpm;
+}
+
+bool AntilagSystemBase::isALSMaxRPMCondition(float rpm) const {
+	return engineConfiguration->ALSMaxRPM > rpm;
+}
+
+bool AntilagSystemBase::isALSMinCLTCondition() const {
+	int clt = Sensor::getOrZero(SensorType::Clt);
+
+	return engineConfiguration->ALSMinCLT < clt;
+}
+
+bool AntilagSystemBase::isALSMaxCLTCondition() const {
+	int clt = Sensor::getOrZero(SensorType::Clt);
+
+	return engineConfiguration->ALSMaxCLT > clt;
+}
+
+bool AntilagSystemBase::isALSMaxThrottleIntentCondition() const {
+	int throttleIntent = Sensor::getOrZero(SensorType::DriverThrottleIntent);
+
+	return engineConfiguration->ALSMaxTPS > throttleIntent;
+}
+
+bool AntilagSystemBase::isAntilagConditionMet(float rpm) {
+	ALSMinRPMCondition = isALSMinRPMCondition(rpm);
+	ALSMaxRPMCondition = isALSMaxRPMCondition(rpm);
+	ALSMinCLTCondition = isALSMinCLTCondition();
+	ALSMaxCLTCondition = isALSMaxCLTCondition();
+	ALSMaxThrottleIntentCondition = isALSMaxThrottleIntentCondition();
+	ALSSwitchCondition = isInsideALSSwitchCondition();
+
+	return ALSMinRPMCondition && ALSMaxRPMCondition && ALSMinCLTCondition && ALSMaxCLTCondition &&
+		   ALSMaxThrottleIntentCondition && ALSSwitchCondition;
+}
+
+void AntilagSystemBase::update() {
+	float rpm = Sensor::getOrZero(SensorType::Rpm);
+	isAntilagCondition = engineConfiguration->antiLagEnabled && isAntilagConditionMet(rpm);
+
+#if EFI_ANTILAG_SYSTEM
+	fuelALSCorrection = getFuelALSCorrection(rpm);
+#endif // EFI_ANTILAG_SYSTEM
+}
+
+#endif /* EFI_ANTILAG_SYSTEM */

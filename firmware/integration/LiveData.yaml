@@ -1,0 +1,162 @@
+#
+# Here we facilitate monitoring by exposing model/transfer object of each individual controller. While some entries are only
+# useful for monitoring the big idea is to bring calculation and monitoring as close to each other as possible by exposing
+# many calculation fields directly
+#
+# here we have LiveData configuration file
+# entry format, where 'key' is a unique ID:
+# key: [NameOfJavaToGenerate.java, folder_where_key.txt_is located, (optional advanced options)]
+# Naming convention: top level struct in .txt file should be called key_s
+# at the moment new line would need to be added into StateDictionary.java manually todo: Add code generation of StateDictionary.java
+#
+# see gen_live_documentation.sh which is the main generation script
+# todo: what is sequence of events in terms of 'live_data_e' code generation?
+#
+Usages:
+#  output_channels always goes first at least because it has protocol version at well-known offset
+  - name: output_channels
+    java: TsOutputs.java
+    folder: console/binary
+    prepend: integration/fome_config_shared.txt
+    constexpr: "engine->outputChannels"
+
+  - name: fuel_computer
+    folder: controllers/algo/fuel
+    prepend: integration/fome_config_shared.txt
+    constexpr: "engine->fuelComputer"
+
+  - name: ignition_state
+    folder: controllers/algo/ignition
+    prepend: integration/fome_config_shared.txt
+    constexpr: "engine->ignitionState"
+
+  - name: knock_controller
+    folder: controllers/engine_cycle
+    prepend: integration/fome_config_shared.txt
+    constexpr: "___engine.module<KnockController>()"
+    isPtr: true
+
+  - name: high_pressure_fuel_pump
+    folder: controllers/engine_cycle
+
+  - name: injector_model
+    folder: controllers/algo/fuel
+    prepend: integration/fome_config_shared.txt
+    # constexpr: "___engine.module<InjectorModel>()"
+    # isPtr: true
+
+  - name: launch_control_state
+    folder: controllers/algo
+
+  - name: torque_reduction_state
+    folder: controllers/algo/torque
+    constexpr: "engine->torqueReductionController"
+    output_name: "Torque reduction"
+
+  - name: traction_control_state
+    folder: controllers/algo/torque
+    constexpr: "engine->tractionController"
+    output_name: "TC"
+
+  - name: torque_model
+    folder: controllers/algo/torque
+    prepend: integration/fome_config_shared.txt
+    output_name: "Torque"
+
+  - name: antilag_system_state
+    folder: controllers/algo
+    prepend: integration/fome_config_shared.txt
+
+  - name: boost_control
+    folder: controllers/actuators
+    prepend: integration/fome_config_shared.txt
+    constexpr: "___engine.module<BoostController>()"
+    isPtr: true
+    conditional_compilation: "EFI_ENGINE_CONTROL"
+    output_name: Boost
+
+  - name: ac_control
+    folder: controllers/actuators
+    prepend: integration/fome_config_shared.txt
+    constexpr: "___engine.module<AcController>()"
+    isPtr: true
+    output_name: AC
+
+  - name: fan_control
+    folder: controllers/modules/fan
+    output_name: [ "Fan 1", "Fan 2" ]
+    constexpr: "___engine.module<FanControl1>()"
+    isPtr: true
+
+  - name: fuel_pump_control
+    folder: controllers/modules/fuel_pump
+
+  - name: main_relay
+    folder: controllers/actuators
+
+  #todo: handle ETB pid and Idle pid which point at same pid_state.txt
+  # - name: pid_state
+  #   folder: util/math
+
+  - name: engine_state
+    folder: controllers/algo
+    prepend: integration/fome_config_shared.txt
+    constexpr: "engine->engineState"
+
+  - name: tps_accel_state
+    folder: controllers/algo
+    prepend: integration/fome_config_shared.txt
+
+  - name: trigger_central
+    folder: controllers/trigger
+    constexpr: "engine->triggerCentral"
+    prepend: integration/fome_config_shared.txt
+    conditional_compilation: "EFI_SHAFT_POSITION_INPUT"
+
+  - name: trigger_state
+    folder: controllers/trigger
+    prepend: integration/fome_config_shared.txt
+    java: TriggerState.java
+    output_name: [ "Trg", "VVT B1I", "VVT B1E", "VVT B2I", "VVT B2E" ]
+
+  - name: trigger_state_primary
+    folder: controllers/trigger
+    prepend: integration/fome_config_shared.txt
+    output_name: Trg
+
+  - name: wall_fuel_state
+    folder: controllers/algo
+
+  - name: idle_state
+    folder: controllers/actuators
+    prepend: integration/fome_config_shared.txt
+    output_name: Idle
+
+  - name: idle_target
+    folder: controllers/actuators
+    prepend: integration/fome_config_shared.txt
+    output_name: Idle
+
+  - name: electronic_throttle
+    folder: controllers/actuators
+    prepend: integration/fome_config_shared.txt
+    output_name: [ "ETB 1", "ETB 2" ]
+
+  - name: wideband_state
+    folder: controllers/sensors/
+    output_name: [ "WBO 1", "WBO 2" ]
+
+  - name: throttle_model
+    folder: controllers/math
+    output_name: Throttle model
+
+  - name: vvt
+    folder: controllers/actuators
+    constexpr: "___engine.module<VvtController1>()"
+    isPtr: true
+    conditional_compilation: "EFI_VVT_PID"
+    output_name: [ "VVT B1I", "VVT B1E", "VVT B2I", "VVT B2E" ]
+
+  - name: lambda_monitor
+    folder: controllers/math
+    constexpr: "___engine.lambdaMonitor"

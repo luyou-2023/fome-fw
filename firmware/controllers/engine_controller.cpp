@@ -1,0 +1,512 @@
+/**
+ * @file    engine_controller.cpp
+ * @brief   Controllers package entry point code
+ *
+ *
+ *
+ * @date Feb 7, 2013
+ * @author Andrey Belomutskiy, (c) 2012-2020
+ *
+ * This file is part of rusEfi - see http://rusefi.com
+ *
+ * rusEfi is free software; you can redistribute it and/or modify it under the terms of
+ * the GNU General Public License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
+ *
+ * rusEfi is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program.
+ * If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* [引擎控制器] 引擎控制器的入口点与主循环调度 */
+
+#include "pch.h"
+
+#include "trigger_central.h"
+#include "script_impl.h"
+#include "idle_thread.h"
+#include "main_trigger_callback.h"
+#include "flash_main.h"
+#include "bench_test.h"
+#include "electronic_throttle.h"
+#include "high_pressure_fuel_pump.h"
+#include "malfunction_indicator.h"
+#include "speed_density.h"
+#include "cpu_usage.h"
+#include "local_version_holder.h"
+#include "alternator_controller.h"
+#include "fuel_math.h"
+#include "spark_logic.h"
+#include "vvt.h"
+#include "boost_control.h"
+#include "fan_control.h"
+#include "launch_control.h"
+#include "speedometer.h"
+#include "gppwm.h"
+#include "date_stamp.h"
+#include "start_stop.h"
+#include "vr_pwm.h"
+#include "adc_subscription.h"
+
+#if EFI_TUNER_STUDIO
+#include "tunerstudio.h"
+#endif /* EFI_TUNER_STUDIO */
+
+#if EFI_USB_SERIAL
+#include "usbconsole.h"
+#endif // EFI_USB_SERIAL
+
+#if !EFI_UNIT_TEST
+#include "init.h"
+
+/**
+ * Would love to pass reference to configuration object into constructor but C++ does allow attributes after
+ * parenthesized initializer
+ */
+Engine ___engine CCM_OPTIONAL;
+
+#else // EFI_UNIT_TEST
+
+Engine* engine;
+
+#endif /* EFI_UNIT_TEST */
+
+void initDataStructures() {
+#if EFI_ENGINE_CONTROL
+	initFuelMap();
+#endif // EFI_ENGINE_CONTROL
+}
+
+static void resetAccel() {
+	engine->module<TpsAccelEnrichment>()->resetAE();
+
+	for (size_t i = 0; i < efi::size(engine->injectionEvents.elements); i++) {
+		engine->injectionEvents.elements[i].getWallFuel().resetWF();
+	}
+}
+
+void doPeriodicSlowCallback() {
+	ScopePerf perf(PE::EnginePeriodicSlowCallback);
+
+	{
+		// Slow callback runs at 20 Hz; sample CPU usage every 5 ticks (0.25 s).
+		static uint8_t cpuUsageDivider = 0;
+		if (++cpuUsageDivider >= 5) {
+			cpuUsageDivider = 0;
+			engine->outputChannels.cpuUsage = cpuUsageSampleAndReset();
+		}
+	}
+
+#if EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT
+	slowStartStopButtonCallback();
+
+	engine->rpmCalculator.onSlowCallback();
+
+	if (engine->triggerCentral.directSelfStimulation || engine->rpmCalculator.isStopped()) {
+		/**
+		 * rusEfi usually runs on hardware which halts execution while writing to internal flash, so we
+		 * postpone writes to until engine is stopped. Writes in case of self-stimulation are fine.
+		 *
+		 * todo: allow writing if 2nd bank of flash is used
+		 */
+#if EFI_INTERNAL_FLASH
+		writeToFlashIfPending();
+#endif /* EFI_INTERNAL_FLASH */
+	}
+
+	if (engine->rpmCalculator.isStopped()) {
+		resetAccel();
+	}
+
+	engine->periodicSlowCallback();
+#else /* if EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT */
+#if EFI_INTERNAL_FLASH
+	writeToFlashIfPending();
+#endif /* EFI_INTERNAL_FLASH */
+#endif /* if EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT */
+}
+
+char* getPinNameByAdcChannel(const char* msg, adc_channel_e hwChannel, char* buffer) {
+#if HAL_USE_ADC
+	if (!isAdcChannelValid(hwChannel)) {
+		strcpy(buffer, "NONE");
+	} else {
+		strcpy(buffer, portname(getAdcChannelPort(msg, hwChannel)));
+		itoa10(&buffer[2], getAdcChannelPin(hwChannel));
+	}
+#else
+	strcpy(buffer, "NONE");
+#endif /* HAL_USE_ADC */
+	return buffer;
+}
+
+static void printSensorInfo() {
+#if HAL_USE_ADC
+	// Print info about analog mappings
+	AdcSubscription::PrintInfo();
+#endif // HAL_USE_ADC
+
+	// Print info about all sensors
+	Sensor::showAllSensorInfo();
+}
+
+void LedBlinkingTask::onSlowCallback() {
+	updateRunningLed();
+	updateWarningLed();
+	updateCommsLed();
+	updateErrorLed();
+}
+
+void LedBlinkingTask::updateRunningLed() {
+#if EFI_SHAFT_POSITION_INPUT
+	bool is_running = engine->rpmCalculator.isRunning();
+#else
+	bool is_running = false;
+#endif /* EFI_SHAFT_POSITION_INPUT */
+
+	// Running -> flashing
+	// Stopped -> off
+	// Cranking -> on
+
+	if (is_running) {
+		// blink in running mode
+		enginePins.runningLedPin.toggle();
+	} else {
+		bool is_cranking = engine->rpmCalculator.isCranking();
+		enginePins.runningLedPin.setValue(is_cranking);
+	}
+}
+
+void LedBlinkingTask::updateWarningLed() {
+	bool warnLedState = Sensor::getOrZero(SensorType::BatteryVoltage) < LOW_VBATT;
+
+#if EFI_ENGINE_CONTROL
+	// TODO: should this do something more intelligent?
+	// warnLedState |= isTriggerErrorNow();
+#endif
+
+	// todo: at the moment warning codes do not affect warning LED?!
+	enginePins.warningLedPin.setValue(warnLedState);
+}
+
+static std::atomic<bool> consoleByteArrived = false;
+
+void onDataArrived() {
+	consoleByteArrived.store(true);
+}
+
+void LedBlinkingTask::updateCommsLed() {
+	// USB unplugged (or no USB) -> off, blink on
+	// USB plugged in -> on, blink off
+	// Data transferring -> flashing
+
+	if (consoleByteArrived.exchange(false)) {
+		enginePins.communicationLedPin.toggle();
+	} else {
+		bool usbReady =
+#if EFI_USB_SERIAL
+				is_usb_serial_ready()
+#else
+				true
+#endif
+				;
+
+		// toggle the state 1/20 of the time so it blinks at you a little
+		bool ledState = usbReady ^ (m_commBlinkCounter >= 19);
+		enginePins.communicationLedPin.setValue(ledState);
+
+		if (m_commBlinkCounter == 0) {
+			m_commBlinkCounter = 20;
+		}
+
+		m_commBlinkCounter--;
+	}
+}
+
+void LedBlinkingTask::updateErrorLed() {
+	if (hasFirmwareError()) {
+		if (m_errorBlinkCounter == 0) {
+			enginePins.errorLedPin.toggle();
+			m_errorBlinkCounter = 5;
+		}
+
+		m_errorBlinkCounter--;
+	}
+}
+
+// this method is used by real firmware and simulator and unit test
+void commonInitEngineController() {
+#if EFI_SIMULATOR || EFI_UNIT_TEST
+	printf("commonInitEngineController\n");
+#endif
+
+#if EFI_ENGINE_CONTROL
+	/**
+	 * This has to go after 'enginePins.startPins()' in order to
+	 * properly detect un-assigned output pins
+	 */
+	prepareOutputSignals();
+
+	engine->injectionEvents.addFuelEvents();
+#endif // EFI_ENGINE_CONTROL
+
+#if EFI_PROD_CODE || EFI_SIMULATOR
+	initSettings();
+
+	if (hasFirmwareError()) {
+		return;
+	}
+#endif
+
+#if !EFI_UNIT_TEST && EFI_ENGINE_CONTROL
+	initBenchTest();
+#endif /* EFI_PROD_CODE && EFI_ENGINE_CONTROL */
+
+#if EFI_ALTERNATOR_CONTROL
+	initAlternatorCtrl();
+#endif /* EFI_ALTERNATOR_CONTROL */
+
+#if EFI_VVT_PID
+	initVvtActuators();
+#endif /* EFI_VVT_PID */
+
+#if EFI_MALFUNCTION_INDICATOR
+	initMalfunctionIndicator();
+#endif /* EFI_MALFUNCTION_INDICATOR */
+
+#if !EFI_UNIT_TEST
+	// This is tested independently - don't configure sensors for tests.
+	// This lets us selectively mock them for each test.
+	initNewSensors();
+#endif /* EFI_UNIT_TEST */
+
+	initSensors();
+
+	initAccelEnrichment();
+
+	initScriptImpl();
+
+	initGpPwm();
+
+#if EFI_IDLE_CONTROL
+	startIdleThread();
+#endif /* EFI_IDLE_CONTROL */
+
+	initButtonDebounce();
+	initStartStopButton();
+
+#if EFI_ELECTRONIC_THROTTLE_BODY
+	initElectronicThrottle();
+#endif /* EFI_ELECTRONIC_THROTTLE_BODY */
+
+#ifdef MODULE_MAP_AVERAGING
+	initMapAveraging();
+#endif /* MODULE_MAP_AVERAGING */
+
+#if EFI_ENGINE_CONTROL
+	initBoostCtrl();
+	initFanControl();
+#endif /* EFI_ENGINE_CONTROL */
+
+#if EFI_LAUNCH_CONTROL
+	initLaunchControl();
+#endif
+
+	engine->rpmCalculator.Register();
+
+	initTachometer();
+	initSpeedometer();
+}
+
+// Returns false if there's an obvious problem with the loaded configuration
+bool validateConfig() {
+	if (engineConfiguration->cylindersCount > MAX_CYLINDER_COUNT) {
+		firmwareError("Invalid cylinder count: %d", engineConfiguration->cylindersCount);
+		return false;
+	}
+
+	ensureArrayIsAscending("Injector deadtime", engineConfiguration->injector.battLagCorrBins);
+
+	// Fueling
+	{
+		ensureArrayIsAscending("VE load", config->veLoadBins);
+		ensureArrayIsAscending("VE RPM", config->veRpmBins);
+
+		ensureArrayIsAscending("Lambda/AFR load", config->lambdaLoadBins);
+		ensureArrayIsAscending("Lambda/AFR RPM", config->lambdaRpmBins);
+
+		ensureArrayIsAscending("Fuel CLT mult", config->cltFuelCorrBins);
+		ensureArrayIsAscending("Fuel IAT mult", config->iatFuelCorrBins);
+
+		ensureArrayIsAscending("Injection phase load", config->injPhaseLoadBins);
+		ensureArrayIsAscending("Injection phase RPM", config->injPhaseRpmBins);
+
+		ensureArrayIsAscending("TPS/TPS AE from", config->tpsTpsAccelFromRpmBins);
+		ensureArrayIsAscending("TPS/TPS AE to", config->tpsTpsAccelToRpmBins);
+
+		ensureArrayIsAscendingOrDefault("TPS TPS RPM correction", config->tpsTspCorrValuesBins);
+
+		if (engineConfiguration->enableStagedInjection) {
+			ensureArrayIsAscendingOrDefault("Staging Load", config->injectorStagingLoadBins);
+			ensureArrayIsAscendingOrDefault("Staging RPM", config->injectorStagingRpmBins);
+		}
+	}
+
+	// Ignition
+	{
+		ensureArrayIsAscending("Dwell RPM", config->sparkDwellRpmBins);
+
+		ensureArrayIsAscending("Ignition load", config->ignitionLoadBins);
+		ensureArrayIsAscending("Ignition RPM", config->ignitionRpmBins);
+
+		if (engineConfiguration->enableTrailingSparks) {
+			ensureArrayIsAscending("Trailing spark load", config->trailingIgnitionLoadBins);
+			ensureArrayIsAscending("Trailing spark RPM", config->trailingIgnitionRpmBins);
+		}
+
+		ensureArrayIsAscending("Ignition CLT corr", config->cltTimingBins);
+
+		ensureArrayIsAscending("Ignition IAT corr IAT", config->ignitionIatCorrTempBins);
+		ensureArrayIsAscending("Ignition IAT corr Load", config->ignitionIatCorrLoadBins);
+	}
+
+	ensureArrayIsAscendingOrDefault("Map estimate TPS", config->mapEstimateTpsBins);
+	ensureArrayIsAscendingOrDefault("Map estimate RPM", config->mapEstimateRpmBins);
+
+	ensureArrayIsAscendingOrDefault("Script Curve 1", config->scriptCurve1Bins);
+	ensureArrayIsAscendingOrDefault("Script Curve 2", config->scriptCurve2Bins);
+	ensureArrayIsAscendingOrDefault("Script Curve 3", config->scriptCurve3Bins);
+	ensureArrayIsAscendingOrDefault("Script Curve 4", config->scriptCurve4Bins);
+	ensureArrayIsAscendingOrDefault("Script Curve 5", config->scriptCurve5Bins);
+	ensureArrayIsAscendingOrDefault("Script Curve 6", config->scriptCurve6Bins);
+
+	// todo: huh? why does this not work on CI?	ensureArrayIsAscendingOrDefault("Dwell Correction Voltage",
+	// engineConfiguration->dwellVoltageCorrVoltBins);
+
+	if (isAdcChannelValid(engineConfiguration->mafAdcChannel)) {
+		ensureArrayIsAscending("MAF transfer function", config->mafDecodingBins);
+	}
+
+	if (isAdcChannelValid(engineConfiguration->fuelLevelSensor)) {
+		ensureArrayIsAscending("Fuel level curve", config->fuelLevelBins);
+	}
+
+	// Cranking tables
+	ensureArrayIsAscending("Cranking fuel mult", config->crankingFuelBins);
+	ensureArrayIsAscending("Cranking duration", config->crankingCycleBins);
+	ensureArrayIsAscending("Cranking TPS", config->crankingTpsBins);
+
+	// Idle tables
+	ensureArrayIsAscending("Idle target RPM", config->cltIdleRpmBins);
+	ensureArrayIsAscending("Idle warmup mult", config->cltIdleCorrBins);
+
+	if (engineConfiguration->useIacTableForCoasting) {
+		ensureArrayIsAscendingOrDefault("Idle coasting RPM", config->iacCoastingRpmBins);
+	}
+
+	if (engineConfiguration->useSeparateVeForIdle) {
+		ensureArrayIsAscendingOrDefault("Idle VE RPM", config->idleVeRpmBins);
+		ensureArrayIsAscendingOrDefault("Idle VE Load", config->idleVeLoadBins);
+	}
+
+	if (engineConfiguration->useSeparateAdvanceForIdle) {
+		ensureArrayIsAscendingOrDefault("Idle timing", config->idleAdvanceBins);
+	}
+
+	for (size_t index = 0; index < efi::size(config->vrThreshold); index++) {
+		auto& cfg = config->vrThreshold[index];
+
+		if (cfg.pin == Gpio::Unassigned) {
+			continue;
+		}
+		ensureArrayIsAscending("VR threshold", cfg.rpmBins);
+	}
+
+	// Boost
+	if (engineConfiguration->isBoostControlEnabled) {
+		ensureArrayIsAscending("Boost open loop Y axis", config->boostTpsBins);
+		ensureArrayIsAscending("Boost open loop X axis", config->boostRpmBins);
+
+		if (engineConfiguration->boostType == CLOSED_LOOP) {
+			ensureArrayIsAscending("Boost closed loop X axis", config->boostClosedLoopXAxisBins);
+			ensureArrayIsAscending("Boost closed loop Y axis", config->boostClosedLoopYAxisBins);
+		}
+	}
+
+#if EFI_ANTILAG_SYSTEM
+	// ALS
+	if (engineConfiguration->antiLagEnabled) {
+		ensureArrayIsAscendingOrDefault("ign ALS TPS", config->alsIgnRetardLoadBins);
+		ensureArrayIsAscendingOrDefault("ign ALS RPM", config->alsIgnRetardrpmBins);
+		ensureArrayIsAscendingOrDefault("fuel ALS TPS", config->alsFuelAdjustmentLoadBins);
+		ensureArrayIsAscendingOrDefault("fuel ALS RPM", config->alsFuelAdjustmentrpmBins);
+	}
+#endif // EFI_ANTILAG_SYSTEM
+
+	// ETB
+	ensureArrayIsAscending("Pedal map pedal", config->pedalToTpsPedalBins);
+	ensureArrayIsAscending("Pedal map RPM", config->pedalToTpsRpmBins);
+
+	if (engineConfiguration->hpfpCamLobes > 0) {
+		ensureArrayIsAscending("HPFP compensation", config->hpfpCompensationRpmBins);
+		ensureArrayIsAscending("HPFP deadtime", config->hpfpDeadtimeVoltsBins);
+		ensureArrayIsAscending("HPFP lobe profile", config->hpfpLobeProfileQuantityBins);
+		ensureArrayIsAscending("HPFP target rpm", config->hpfpTargetRpmBins);
+		ensureArrayIsAscending("HPFP target load", config->hpfpTargetLoadBins);
+	}
+
+	// VVT
+	if (isBrainPinValid(engineConfiguration->camInputs[0])) {
+		ensureArrayIsAscending("VVT intake load", config->vvtTable1LoadBins);
+		ensureArrayIsAscending("VVT intake RPM", config->vvtTable1RpmBins);
+	}
+
+#if CAM_INPUTS_COUNT != 1
+	if (isBrainPinValid(engineConfiguration->camInputs[1])) {
+		ensureArrayIsAscending("VVT exhaust load", config->vvtTable2LoadBins);
+		ensureArrayIsAscending("VVT exhaust RPM", config->vvtTable2RpmBins);
+	}
+#endif
+
+	if (engineConfiguration->enableOilPressureProtect) {
+		ensureArrayIsAscending("Oil pressure protection", config->minimumOilPressureBins);
+	}
+
+	if (engineConfiguration->injectorNonlinearMode == INJ_SmallPulseAdder) {
+		ensureArrayIsAscending("Small PW adder", config->smallPulseAdderBins);
+	}
+
+	if (engineConfiguration->enableTorqueModel) {
+		ensureArrayIsAscending("Driver torque demand pedal", config->driverTorquePedalBins);
+		ensureArrayIsAscending("Driver torque demand RPM", config->driverTorqueRpmBins);
+
+		ensureArrayIsAscending("Torque reduction bins", config->torqueReductionRetardReqBins);
+	}
+
+	return true;
+}
+
+#if !EFI_UNIT_TEST
+
+void initEngineController() {
+	addConsoleAction("sensorinfo", printSensorInfo);
+
+	commonInitEngineController();
+
+	if (hasFirmwareError()) {
+		return;
+	}
+
+	initVrPwm();
+}
+
+/**
+ * See also GIT_HASH
+ */
+int getRusEfiVersion() {
+	return VCS_DATE;
+}
+#endif /* EFI_UNIT_TEST */
