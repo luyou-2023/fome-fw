@@ -2,165 +2,201 @@
 
 ## 1. 场景描述
 
-在精确的曲轴角度触发电火花，点燃气缸内的混合气，使燃烧产生的压力最大化地推动活塞做功。
+在精确曲轴角度触发电火花，使燃烧压力峰值出现在上止点后 10–15°，最大化做功效率。FOME 采用**快速回调计算 + 触发回调调度**的双路径架构，与燃油控制类似。
 
-## 2. 点火提前角原理
+---
 
-```
-          TDC (上止点)
-    -30°      |       +30°
-       \      |      /
-        \     |     /
-         \    |    /
-          \   |   /
-           \  |  /
-            \ | /
-   点火时刻 ───┴───→
-
-最佳MBT: 在TDC前(提前)某个角度点火
-让燃烧压力峰值出现在TDC后10-15°
-```
-
-**为什么需要提前点火**: 混合气从火花塞跳火到完全燃烧需要时间（约2ms）。如果在上止点点火，燃烧压力峰值会出现在活塞下行之后，做功效率降低。提前点火让燃烧在压缩行程中开始，压力峰值在上止点后形成。
-
-## 3. 基础点火提前角计算
-
-```c
-finalAdvance = baseAdvance + corrections
-  baseAdvance = ignitionTable(rpm, load)   // 3D查表
-  corrections:
-    + iatCorrection    // 进气温度修正
-    + cltCorrection    // 水温修正
-    + knockRetard      // 爆震推迟
-    + idleTimingAdjust // 怠速辅助
-    + alsCorrection    // 防滞后系统
-    + LuaAdjustment    // Lua脚本修正
-  clamp: [minimumIgnitionTiming, maximumIgnitionTiming]
-```
-
-### 基础点火表
-
-3D表 (RPM × 负荷 → 点火提前角) 是点火控制的核心：
-- 低负荷/低RPM → 较小提前角 (燃烧速度慢，但爆震倾向低)
-- 中负荷/中RPM → 最大提前角 (MBT)
-- 高负荷/高RPM → 较小提前角 (爆震限制)
-- 大负荷区域 → 推迟点火 (防爆震 + 保护发动机)
-
-## 4. Dwell (线圈充电时间) 控制
-
-```c
-// 线圈充电时间:
-// t_dwell = dwellAngle / (rpm × 6)  (分钟→毫秒转换)
-// dwellAngle = dwellDuration(rpm, battVoltage) 查表
-// 高电压 → 充电更快 → dwell角度可以小些
-// 低电压 → 充电更慢 → dwell角度需要大些
-```
-
-### 保护机制
-
-**Underdwell保护**:
-```c
-// 当RPM突然升高，dwell时间不够时:
-// 1. 自动减少点火提前角 (给更多时间充电)
-// 2. 如果提前角达到极限 → 跳过这次点火
-// 目的: 保证火花能量足够，防止失火
-```
-
-**Overdwell保护**:
-```c
-// 当点火被跳过 (如弹射控制限制) 而线圈已经开始充电时:
-// 线圈温度会快速升高 → 可能烧毁
-// 解决方案: 安排"保护火花"在晚些角度释放线圈能量
-```
-
-## 5. 爆震控制
-
-### 检测
+## 2. 数据流
 
 ```
-爆震传感器 (加速度传感器)
-  → ADC采样 (爆震频率窗口)
-  → 带通滤波 (5-15kHz, 取决于缸径)
-  → RMS计算 → dB转换
-  → 与背景噪声阈值比较
-  → 判定是否爆震
+主循环 250Hz: EngineState::periodicFastCallback()
+  ├─ ignitionState.updateDwell(rpm, isCranking)
+  ├─ ignitionState.updateAdvanceCorrections(load)
+  ├─ getAdvance(rpm, load, isCranking)
+  │    ├─ 起动: getCrankingAdvance() → 独立表或线性过渡
+  │    └─ 运行: getRunningAdvance() → ignitionTable 3D查表
+  │    + getAdvanceCorrections() (IAT/CLT/怠速/DFCO)
+  │    - knockRetard
+  │    - torqueReduction
+  └─ cylinders[i].setIgnitionTimingBtdc()
+
+触发中断: onTriggerEventSparkLogic(phase)
+  ├─ prepareIgnitionSchedule() 若未就绪
+  └─ 对每个气缸:
+       ├─ isPhaseInRange(dwellAngle) → scheduleByAngle(线圈充电)
+       └─ scheduleByAngle(sparkAngle) → 跳火
 ```
 
-```c
-// 滤除背景噪声是关键:
-// knockThreshold = backgroundNoise + configThreshold
-// 每个气缸独立的背景噪声水平
-// 背景噪声随时间自适应 (发动机磨损后噪声会变化)
+---
+
+## 3. 调用时序图
+
+```mermaid
+sequenceDiagram
+    participant ML as 主循环 250Hz
+    participant ES as EngineState
+    participant IS as IgnitionState
+    participant KC as KnockController
+    participant TC as onTriggerEventSparkLogic
+    participant COIL as 点火线圈
+
+    ML->>ES: periodicFastCallback()
+    ES->>IS: updateDwell(rpm, isCranking)
+    alt isCranking
+        IS->>IS: dwellMs = ignitionDwellForCrankingMs
+    else running
+        IS->>IS: dwellMs = sparkDwellTable × voltageCorr
+    end
+    ES->>IS: getAdvance(rpm, load, isCranking)
+    IS->>IS: baseAdvance + corrections - knockRetard
+    ES->>ES: cylinders[i].setIgnitionTimingBtdc()
+
+    Note over TC,COIL: 触发齿中断
+    TC->>TC: prepareIgnitionSchedule()
+    loop 每个气缸
+        TC->>TC: isPhaseInRange(dwellAngle)?
+        alt dwell 在当前窗口
+            TC->>COIL: scheduleByAngle(dwellStart)
+            TC->>COIL: scheduleByAngle(sparkFire)
+        end
+    end
+
+    Note over KC: 爆震窗口(ADC采样完成后)
+    KC->>KC: onKnockSenseCompleted(dbv)
+    alt dbv > threshold
+        KC->>KC: m_knockRetard += retardAmount
+    end
 ```
 
-### 响应
+---
 
-```c
-onKnockDetected(cylinder):
-  // 1. 立即推迟该气缸点火 (通常3-5°)
-  // 2. 其他气缸也稍微推迟 (如果爆震严重)
-  // 3. 逐渐恢复到正常提前角 (按恢复速率增补)
-  // 4. 如果持续爆震 → 保持推迟并报警
+## 4. 关键代码分析
+
+### 4.1 提前角计算
+
+```186:210:firmware/controllers/algo/ignition/ignition_state.cpp
+angle_t IgnitionState::getAdvance(float rpm, float engineLoad, bool isCranking) {
+	if (isCranking) {
+		angle = getCrankingAdvance(rpm, engineLoad);
+	} else {
+		angle = getRunningAdvance(rpm, engineLoad);
+	}
+	angle += getAdvanceCorrections(isCranking);
+	wrapAngle(angle, "getAdvance", ObdCode::CUSTOM_ADCANCE_CALC_ANGLE);
+	return angle;
+}
 ```
 
-**为什么可以逐缸推迟**: 每个气缸的爆震倾向不同（冷却/积碳/压缩比差异），逐缸控制可以精确到每个气缸的极限，在保护发动机的同时保持最大性能。
+起动过渡：从 `crankingTimingAngle`（默认 6° BTDC）线性插值到 `cranking.rpm` 处的运行表值：
 
-## 6. 多火花策略
-
-```c
-getNumberOfSparks(mode):
-  // 在特定模式下每个周期产生多个火花
-  // 稀薄燃烧/极寒起动时使用
-  // 每个额外火花延迟一定角度 (如10°)
-  // 提高混合气点燃可靠性
+```165:183:firmware/controllers/algo/ignition/ignition_state.cpp
+static angle_t getCrankingAdvance(float rpm, float engineLoad) {
+	angle_t crankingToRunningTransitionAngle = getRunningAdvance(engineConfiguration->cranking.rpm, engineLoad);
+	return interpolateClamped(minCrankingRpm, engineConfiguration->crankingTimingAngle,
+							  engineConfiguration->cranking.rpm, crankingToRunningTransitionAngle, rpm);
+}
 ```
 
-## 7. 点火限制和特殊模式
+修正项仅在 `timingMode == TM_DYNAMIC` 时生效，起动时默认不加修正（除非 `useAdvanceCorrectionsForCranking`）。
 
-### 弹射起步限制
+### 4.2 Dwell 控制
 
-- 在指定RPM区间内限制点火提前角
-- 配合燃油控制和节气门控制
-- 产生受控的"软"弹射
-
-### 防滞后系统 (ALS)
-
-```c
-// 拉力赛/竞技场景:
-// 在松油门时推迟点火 + 保持节气门打开
-// 废气高温驱动涡轮持续增压
-// 代价: 极高排气温度 (需监控EGT)
+```258:262:firmware/controllers/algo/ignition/ignition_state.cpp
+floatms_t IgnitionState::getSparkDwell(float rpm, bool isCranking) {
+	if (isCranking) {
+		dwellMs = engineConfiguration->ignitionDwellForCrankingMs;  // 固定 6ms
+	} else {
+		baseDwell = interpolate2d(rpm, sparkDwellRpmBins, sparkDwellValues);
+		dwellMs = baseDwell * dwellVoltageCorrection;
+	}
+}
 ```
 
-### 扭矩管理
+运行模式：Dwell 角度 = `dwellMs × rpm × 6 / 1000`。若 Dwell 角度超过可用窗口，触发 **Underdwell 保护**——自动推迟点火角或跳过本次点火。
 
-- 换挡时临时推迟点火降低扭矩
-- 牵引力控制时推迟点火
-- 与电子节气门协同工作
+### 4.3 触发回调中的点火调度
 
-## 8. 点火系统架构
-
-| 点火模式 | 硬件 | 特点 |
-|---------|------|------|
-| 独立点火 (COP) | 每缸一个线圈 | 最灵活, 支持逐缸爆震控制 |
-| 双缸点火 (Wasted Spark) | 每两缸一个线圈 | 一半线圈, 排气上止点也跳火 |
-| 单线圈+分电器 | 一个线圈+机械分配 | 成本最低, 灵活性差 |
-
-### 浪费点火 (Wasted Spark) 角度计算
-
-```c
-// 计算配对气缸角度时考虑:
-// 普通: 配对气缸角度 = 本缸角度 + 360° (4缸)
-// 不等点火间隔: 需要查表 (如VR6发动机)
+```422:496:firmware/controllers/engine_cycle/spark_logic.cpp
+void onTriggerEventSparkLogic(const EnginePhaseInfo& phase) {
+	if (!engineConfiguration->isIgnitionEnabled) return;
+	const floatms_t dwellMs = engine->ignitionState.getDwell();
+	if (!engine->ignitionEvents.isReady) {
+		prepareIgnitionSchedule();
+	}
+	for (size_t i = 0; i < cylindersCount; i++) {
+		if (!isPhaseInRange(EngPhase{dwellAngle}, phase)) {
+			continue;  // dwell 不在当前齿窗口，等下次
+		}
+		angle_t sparkAngle = event.calculateSparkAngle();
+		// 弹射/扭矩限制/ALS 可能 skip
+		scheduleByAngle(nullptr, phase.timestamp, angleFromNow, {&startCoilCharge, ctx});
+		scheduleByAngle(nullptr, sparkTime, sparkAngleFromNow, {&fireSpark, ctx});
+	}
+}
 ```
 
-## 9. 点火正时与燃油喷射的协调
+**要点**：Dwell 开始和跳火分别按角度调度；每个触发齿检查当前窗口内是否有待执行的事件。
 
-燃油喷射通常在进气门关闭前结束，让燃油有足够时间汽化。点火在压缩上止点前发生。两者在发动机周期中的关系：
+### 4.4 爆震检测与响应
+
+```57:94:firmware/controllers/engine_cycle/knock_controller.cpp
+bool KnockControllerBase::onKnockSenseCompleted(uint8_t cylinderNumber, ..., float dbv, ...) {
+	dbv += m_gain[cylinderNumber];
+	bool isKnock = dbv > m_knockThreshold;
+	if (isKnock) {
+		auto baseTiming = engine->cylinders[cylinderNumber].getIgnitionTimingBtdc();
+		auto distToMinimum = baseTiming - (-20);
+		auto retardAmount = distToMinimum * knockRetardAggression * 0.01f;
+		m_knockRetard = clampF(0, m_knockRetard + retardAmount, m_maximumRetard);
+	}
+	return isKnock;
+}
+```
+
+`m_knockRetard` 在 `getAdvanceCorrections()` 中减去，影响所有气缸。无爆震时按 `knockRetardReapplyRate` 逐渐恢复。
+
+### 4.5 多火花
+
+```218:252:firmware/controllers/algo/ignition/ignition_state.cpp
+size_t getMultiSparkCount(float rpm) {
+	if (multisparkEnable && rpm <= multisparkMaxRpm && rpm != 0) {
+		float additionalSparksUs = usPerDegree * multisparkMaxSparkingAngle;
+		float oneSparkTime = multiDelay + multiDwell;
+		return minI(floor(additionalSparksUs / oneSparkTime), multisparkMaxExtraSparkCount);
+	}
+	return 0;
+}
+```
+
+RPM = 0 时禁用多火花——转速未知时不安全。
+
+---
+
+## 5. 点火模式
+
+| 模式 | 硬件 | 特点 |
+|------|------|------|
+| 独立点火 (COP) | 每缸一个线圈 | 最灵活，支持逐缸爆震 |
+| 浪费点火 (Wasted Spark) | 每两缸一个线圈 | 排气上止点也跳火 |
+| 单线圈+分电器 | 一个线圈 | 成本最低 |
+
+奇数缸 Wasted Spark 特殊处理：检查 360° 后的 dwell 事件是否在当前窗口，若是则提前执行（`spark_logic.cpp` 第 466–481 行）。
+
+---
+
+## 6. 与燃油喷射的相位关系
 
 ```
 进气行程 → 压缩行程 → 做功行程 → 排气行程
    ↑            ↑           ↑
  喷油结束    点火触发    压力峰值
-             (TDC前)    (TDC后10-15°)
+ (IOT前)     (TDC前)    (TDC后10-15°)
 ```
+
+---
+
+## 7. 设计权衡
+
+- **Dwell 用 ms 而非纯角度（起动）**：低 RPM 时角度 dwell 极长，线圈过热。固定 ms 保证火花能量一致。
+- **爆震退角全局共享**：简化实现，所有气缸同步退角；逐缸退角需要更复杂的调度。
+- **Underdwell 保护优先于性能**：宁可推迟点火也不发出能量不足的火花——失火比稍晚点火危害更大。

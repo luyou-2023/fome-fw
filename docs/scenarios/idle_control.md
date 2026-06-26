@@ -2,92 +2,203 @@
 
 ## 1. 场景描述
 
-发动机在松开油门、变速箱空挡或离合器踩下时维持目标怠速转速。核心挑战在于各种负载变化（空调、发电机、动力转向）对RPM的干扰。
+发动机在松开油门、空挡或离合器踩下时维持目标怠速转速。核心挑战是 AC、发电机、冷却风扇等负载突变对 RPM 的干扰。FOME 采用**双控制器 + 双 PID** 架构：IAC/ETB 调节进气量（慢但范围大），点火角微调（快但范围小）。
 
-## 2. 控制架构
+---
 
-双重控制回路:
+## 2. 数据流
 
 ```
-怠速目标RPM
-  ↓
-┌─ IdleTargetController (确定阶段和目标) ─┐
-│  查表: 水温→目标RPM                      │
-│  加载: AC提升, Lua修正                    │
-└──────────────────────────────────────────┘
-  ↓
-┌─ IdleController (执行控制) ──────────────┐
-│  开环: 基本IAC位置 + 修正项              │
-│  闭环: RPM PID (仅在Idling阶段)          │
-│  定时: 点火提前角辅助PID                 │
-└──────────────────────────────────────────┘
-  ↓
-IAC执行器 (怠速空气控制阀 / 电子节气门微开)
-  + 点火定时微调
+主循环 250Hz
+  ├─ IdleTargetController::getOutput()
+  │    ├─ getTargetRpm(clt)           → 目标 RPM + 进入/退出阈值
+  │    ├─ getCrankingTaperFraction()  → IAC 渐变比例
+  │    └─ determinePhase()            → Cranking / Taper / Idling / Coasting / Running
+  │
+  └─ IdleController::getIdlePosition()
+       ├─ getOpenLoop(phase, ...)     → 开环 IAC 位置
+       ├─ getClosedLoop(phase, ...)   → RPM PID（仅 Idling 阶段）
+       └─ 输出 IAC 位置 → stepper/ETB
+
+  └─ IgnitionState::getIdleTimingAdjustment()  → 点火角 PID（仅 Idling）
+       └─ 叠加到 getAdvance() 结果
 ```
 
-## 3. 状态转换
+---
+
+## 3. 调用时序图
+
+```mermaid
+sequenceDiagram
+    participant ML as 主循环 250Hz
+    participant ITC as IdleTargetController
+    participant IC as IdleController
+    participant IS as IgnitionState
+    participant ACT as IAC/ETB执行器
+
+    ML->>ITC: getOutput(tpsAboveThreshold)
+    ITC->>ITC: getTargetRpm(clt)
+    Note over ITC: target + acIdleRpmBump + luaAddRpm<br/>entryRpm = target + upperLimit<br/>exitRpm = target + 1.5×upperLimit
+    ITC->>ITC: getCrankingTaperFraction()
+    ITC->>ITC: determinePhase(rpm, target, tps, vss, taper)
+    ITC-->>IC: {target, phase, crankingTaperFraction}
+
+    ML->>IC: getIdlePosition(rpm, rpmRate)
+    IC->>IC: getOpenLoop(phase, rpm, clt, tps, taper)
+    alt phase == Cranking
+        IC->>IC: return crankingIACposition × cltCorr
+    else phase == CrankToIdleTaper
+        IC->>IC: interpolate(crankingVal, runningVal, taperFraction)
+    else phase == Idling && IM_AUTO
+        IC->>IC: getClosedLoop() → RPM PID
+    end
+    IC->>ACT: currentIdlePosition
+
+    ML->>IS: getIdleTimingAdjustment(rpm, rpmRate)
+    alt phase == Idling && useIdleTimingPidControl
+        IS->>IS: timingPid.getOutput(targetRpm, rpm)
+    else
+        IS->>IS: return 0, reset PID
+    end
+```
+
+---
+
+## 4. 状态机
 
 ```
                     Cranking
-                        ↓
-              CrankToIdleTaper ← afterCrankingIACtaperDuration
-                        ↓
+                        ↓  RPM ≥ cranking.rpm
+              CrankToIdleTaper ← revolutionCounter / afterCrankingIACtaperDuration
+                        ↓  taperFraction ≥ 1
 Running ←────────→ Idling ←─────────→ Coasting
-                              ← throttle off
-                                      RPM > exit threshold
+  TPS↑              TPS↓, RPM在窗口内    TPS↓, RPM > exitRpm
 ```
 
-## 4. 关键算法
+`determinePhase()` 实现：
 
-### 开环位置
-
-```c
-getRunningOpenLoop(rpm, clt, tps):
-  // 基本位置 (cltIdleCorr表)
-  // + AC补偿 (acIdleExtraOffset)
-  // + 风扇补偿 (fan1ExtraIdle, fan2ExtraIdle)
-  // + Lua补偿
-  // + ALS补偿
-  // + TPS渐变 (突然松油门时缓慢减少)
-  // + RPM渐变 (目标RPM变化时缓慢跟随)
-```
-
-**为什么需要这么多叠加项**: 怠速是一个多变量干扰系统。空调压缩机接合需要额外功率，发电机充电需要机械能，冷却风扇开启也增加负载。每种负载都需要不同量的额外进气补偿。
-
-### 空燃比修正（隐含）
-
-在怠速PID调节IAC（进气量）的同时，燃油系统也会根据进气量的变化自动调整喷油脉宽，维持理论空燃比（14.7:1）。IAC和燃油的协调是自动的——燃油系统跟踪进气传感器（MAF或MAP）的变化。
-
-### 点火定时辅助
-
-```c
-getIdleTimingAdjustment(rpm, rpmRate):
-  // 独立PID, P参数通常较小
-  // 提前角↑ → 燃烧更早 → 扭矩↑ → RPM↑
-  // 提前角↓ → 燃烧推迟 → 扭矩↓ → RPM↓
-  // 响应时间: < 1个发动机周期 (远快于IAC)
-```
-
-**IAC vs 点火定时**: IAC（进气）响应慢但调节范围大；点火定时响应快但调节范围小（通常±5°提前角）。两者配合形成"快慢结合"的策略——点火定时处理瞬时干扰，IAC处理稳态偏差。
-
-### PID积分复位策略
-
-```c
-if (phase != Idling) {
-    // 离开Idling状态时复位PID
-    // 如果积分项为负(进气不足)，也复位
-    // 避免下次进入Idling时积分器残留误差
+```69:117:firmware/controllers/actuators/idle_thread.cpp
+IIdleTargetController::Phase IdleTargetController::determinePhase(...) {
+	if (!engine->rpmCalculator.isRunning()) {
+		return Phase::Cranking;
+	}
+	if (tpsIsAboveIdleThreshold) {
+		return Phase::Running;
+	}
+	if (rpm > targetRpm.IdleExitRpm ||
+		!m_timeSinceCranking.hasElapsedSec(engineConfiguration->inhibitIdleAfterCrankingTime)) {
+		looksLikeCoasting = true;
+	} else if (rpm < targetRpm.IdleEntryRpm) {
+		looksLikeCoasting = false;
+	}
+	if (looksLikeCoasting) {
+		return looksLikeCrankToIdle ? Phase::CrankToIdleTaper : Phase::Coasting;
+	}
+	return Phase::Idling;
 }
 ```
 
-**为什么复位负积分**: 如果因为高负载导致积分器累积了大量正值（需要更多进气），回到Idling时可以快速恢复。但如果积分器是负值（进气过多），回到Idling时会导致怠速过低甚至熄火，所以负积分需要复位。
+**滞回设计**：`IdleExitRpm = target + 1.5 × upperLimit`，`IdleEntryRpm = target + upperLimit`——退出怠速比进入怠速需要更高的 RPM，防止在阈值附近振荡。
 
-## 5. 常见问题
+---
+
+## 5. 关键代码分析
+
+### 5.1 目标 RPM 计算
+
+```36:66:firmware/controllers/actuators/idle_thread.cpp
+IIdleTargetController::TargetInfo IdleTargetController::getTargetRpm(float clt) {
+	targetRpmByClt = interpolate2d(clt, config->cltIdleRpmBins, config->cltIdleRpm);
+	targetRpmAcBump = acButtonState ? engineConfiguration->acIdleRpmBump : 0;
+	auto target = targetRpmByClt + targetRpmAcBump + luaAddRpm;
+	float entryRpm = target + rpmUpperLimit;
+	float exitRpm = target + 1.5 * rpmUpperLimit;
+	return {target, entryRpm, exitRpm};
+}
+```
+
+AC 补偿基于**按钮状态**而非继电器状态——因为 AC 输出有延迟，提前 bump RPM 让 IAC 先增加进气。
+
+### 5.2 开环 IAC 位置
+
+```171:215:firmware/controllers/actuators/idle_thread.cpp
+percent_t IdleController::getRunningOpenLoop(float rpm, float clt, SensorResult tps) {
+	float running = manIdlePosition * interpolate2d(clt, config->cltIdleCorrBins, config->cltIdleCorr);
+	running += acIdleExtraOffset;   // AC 进气补偿
+	running += fan1ExtraIdle + fan2ExtraIdle;
+	running += iacByTpsTaper;       // 松油门渐变
+	running += iacByRpmTaper;       // 目标 RPM 变化渐变
+	return clampF(0, running, 100);
+}
+```
+
+起动→运行渐变：
+
+```218:240:firmware/controllers/actuators/idle_thread.cpp
+percent_t IdleController::getOpenLoop(Phase phase, ...) {
+	if (isCranking) {
+		return getCrankingOpenLoop(clt);  // crankingIACposition × cltCorr
+	}
+	percent_t running = getRunningOpenLoop(rpm, clt, tps);
+	return interpolateClamped(0, crankingVal, 1, running, crankingTaperFraction);
+}
+```
+
+### 5.3 RPM 闭环 PID
+
+仅在 `Phase::Idling` 时激活，离开时复位：
+
+```273:297:firmware/controllers/actuators/idle_thread.cpp
+float IdleController::getClosedLoop(Phase phase, float rpm, float rpmRate, float targetRpm) {
+	if (phase != Phase::Idling) {
+		if (mightResetPid) {
+			if (m_pid.getIntegration() <= 0 || alwaysResetPidLeavingIdle) {
+				m_pid.reset();
+			}
+		}
+		return 0;
+	}
+	m_pid.setDTermOverride(-rpmRate);  // 用 RPM 变化率增强 D 项
+	return m_pid.getOutput(targetRpm, rpm, FAST_CALLBACK_PERIOD_MS / 1000.0f);
+}
+```
+
+**负积分复位策略**：积分项为负（进气过多）时离开 Idling 会复位，防止下次进入时怠速过低甚至熄火。正积分保留——高负载后回到怠速可快速恢复。
+
+### 5.4 点火定时辅助 PID
+
+```247:261:firmware/controllers/actuators/idle_thread.cpp
+float IdleController::getIdleTimingAdjustment(float rpm, float rpmRate, float targetRpm, Phase phase) {
+	if (!engineConfiguration->useIdleTimingPidControl || phase != Phase::Idling) {
+		m_timingPid.reset();
+		return 0;
+	}
+	m_timingPid.setDTermOverride(-rpmRate);
+	return m_timingPid.getOutput(targetRpm, rpm, FAST_CALLBACK_PERIOD_MS / 1000.0f);
+}
+```
+
+提前角 ↑ → 燃烧更早 → 扭矩 ↑ → RPM ↑。响应时间 < 1 个发动机周期，远快于 IAC 的数百 ms。
+
+### 5.5 与燃油系统的协调
+
+IAC 改变进气量后，Speed-Density 或 MAF 模型在下一个 250 Hz 周期自动重新计算喷油量，维持目标 Lambda。IAC 和燃油无需显式协调——燃油系统跟踪 MAP/MAF 变化。
+
+---
+
+## 6. 常见问题
 
 | 症状 | 可能原因 | 排查方向 |
 |------|---------|---------|
-| 怠速不稳 | PID参数不当 | 检查Ki/Kp;检查IAC阀工作 |
-| 怠速过高 | 基本位置设置过高 | 检查cltIdleCorr/manIdlePosition |
-| 松油门熄火 | Coasting策略不当 | 检查iacCoasting表/AirTaper设置 |
-| 开空调熄火 | AC补偿不足 | 增加acIdleRpmBump/acIdleExtraOffset |
+| 怠速不稳 | PID 参数不当 | 检查 Kp/Ki；检查 IAC 阀响应 |
+| 怠速过高 | 基本位置过高 | 检查 cltIdleCorr / manIdlePosition |
+| 松油门熄火 | Coasting 策略不当 | 检查 iacCoasting 表 / AirTaper |
+| 开空调熄火 | AC 补偿不足 | 增加 acIdleRpmBump / acIdleExtraOffset |
+
+---
+
+## 7. 设计权衡
+
+- **快慢双 PID**：点火角处理瞬时干扰（AC 接合瞬间），IAC 处理稳态偏差——两者叠加而非互斥。
+- **Coasting 与 Taper 互斥**：起动后 IAC 渐变期间不允许进入 Coasting 表，避免 IAC 位置跳变。
+- **inhibitIdleAfterCrankingTime**：起动后一段时间内强制 Coasting 相位，防止 RPM 尚未稳定时过早进入闭环怠速。

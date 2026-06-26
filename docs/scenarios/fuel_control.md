@@ -2,148 +2,223 @@
 
 ## 1. 场景描述
 
-燃油控制是ECU的核心功能，需要在所有运行条件下计算正确的喷油量，使空燃比(AFR)达到目标值。
+燃油控制是 ECU 的核心功能：在每个发动机周期计算正确的喷油量，使实际空燃比接近目标 Lambda。计算在 **250 Hz 主循环**中完成，结果写入每缸状态；**触发中断**按曲轴角度执行实际喷油。
 
-## 2. 空气量计算
+---
 
-### 三种空气量模型
+## 2. 数据流
 
 ```
-getAirmassModel(engine_load_mode_e mode)
-  ├── Speed-Density: MAP × VE × IAT修正       # 标配模式
-  ├── MAF: MAF传感器直接测量空气质量           # 高精度测量
-  ├── Alpha-N: TPS × RPM查表                   # 极端凸轮轴重叠
-  └── Lua: 用户脚本自定义                      # 自定义需求
+主循环 250Hz: EngineState::periodicFastCallback()
+  └─ getCycleInjectionMass(rpm, isCranking)
+       ├─ getBaseFuelMass(rpm)
+       │    ├─ getAirmassModel() → Speed-Density / MAF / Alpha-N / Lua
+       │    ├─ model->getAirmass() → 每缸空气量 + 负荷轴
+       │    └─ fuelComputer.getCycleFuel(airmass, rpm, load)
+       │         └─ fuelMass = airMass / (stoich × targetLambda)
+       ├─ getCrankingFuel() 或 getRunningFuel()  ← isCranking 分支
+       ├─ DfcoController::cutFuel() → 可能归零
+       ├─ InjectorModel::prepare() → 计算 dead time
+       └─ TpsAccelEnrichment → 加速补偿质量
+
+  └─ cylinders[i].setInjectionMass()  → 供触发回调读取
+
+触发中断: mainTriggerCallback()
+  └─ FuelSchedule::onTriggerTooth()
+       ├─ wallFuel.adjust(mass)        → 壁膜修正
+       ├─ InjectorModel::getInjectionDuration(mass)
+       └─ scheduleByAngle() → 开/关喷油器
 ```
 
-### Speed-Density (速度密度法)
+---
 
-```c
-// 理想气体状态方程:
-// airMass = (MAP × VE × displacement) / (R × IAT_K)
-// VE(充气效率) 从3D表(RPM × 负荷)查得
-// MAP = 进气歧管绝对压力
-// IAT = 进气温度 (修正空气密度)
+## 3. 调用时序图
+
+```mermaid
+sequenceDiagram
+    participant ML as 主循环 250Hz
+    participant ES as EngineState
+    participant FM as fuel_math
+    participant FC as FuelComputer
+    participant AM as AirmassModel
+    participant DFCO as DfcoController
+    participant IM as InjectorModel
+    participant TC as mainTriggerCallback
+    participant FS as FuelSchedule
+    participant INJ as 喷油器
+
+    ML->>ES: periodicFastCallback()
+    ES->>FM: getCycleInjectionMass(rpm, isCranking)
+    FM->>FM: getBaseFuelMass(rpm)
+    FM->>AM: getAirmass(rpm, true)
+    AM-->>FM: CylinderAirmass, EngineLoadPercent
+    FM->>FC: getCycleFuel(airmass, rpm, load)
+    FC->>FC: targetLambda = lambdaTable(RPM, load)
+    FC-->>FM: baseFuelMass = airMass / (stoich × lambda)
+    alt isCranking
+        FM->>FM: getCrankingFuel(baseFuelMass)
+    else running
+        FM->>FM: getRunningFuel(baseFuelMass)
+    end
+    FM->>DFCO: cutFuel()
+    alt DFCO active
+        DFCO-->>FM: cycleFuelMass = 0
+    end
+    FM->>IM: prepare() + getInjectionDuration()
+    ES->>ES: cylinders[i].setInjectionMass()
+
+    Note over TC,INJ: 触发齿中断(并行)
+    TC->>FS: onTriggerTooth(phase)
+    FS->>FS: getInjectionMass() + wallFuel.adjust()
+    FS->>IM: getInjectionDuration(mass)
+    FS->>INJ: scheduleByAngle(open/close)
 ```
 
-**为什么Speed-Density是最常用的**: 不需要MAF传感器（降低成本），通过MAP传感器和VE表即可计算空气量。VE表可以在测功机上校准，一次校准对所有发动机有效。MAF虽然直接测量空气量，但大流量时压损大，且对进气管路泄漏敏感。
+---
 
-### MAF
+## 4. 关键代码分析
 
-```c
-// 直接查MAF传感器电压→质量流量(kg/h)表
-// airMass = flowRate × (60 / RPM / 2)  (每进气行程)
-// 更精确但不耐脏
+### 4.1 空气量 → 基础喷油量
+
+```245:296:firmware/controllers/algo/fuel_math.cpp
+static float getBaseFuelMass(float rpm) {
+	auto model = getAirmassModel(engineConfiguration->fuelAlgorithm);
+	auto airmass = model->getAirmass(rpm, true);
+	// ... 写入 fuelingLoad, airflowEstimate ...
+	float baseFuelMass = engine->fuelComputer.getCycleFuel(airmass.CylinderAirmass, rpm, airmass.EngineLoadPercent);
+	baseFuelMass *= engineConfiguration->globalFuelCorrection;
+	return baseFuelMass;
+}
 ```
 
-### Alpha-N
+核心转换在 `FuelComputer::getCycleFuel`：
 
-```c
-// airMass = alphaNTable(TPS, RPM)
-// 用于高重叠凸轮轴，MAP信号失真(无法准确反映进气量)的情况
+```16:28:firmware/controllers/algo/fuel/fuel_computer.cpp
+mass_t FuelComputerBase::getCycleFuel(mass_t airmass, float rpm, float load) {
+	load = getTargetLambdaLoadAxis(load);
+	float stoich = getStoichiometricRatio();
+	float lambda = getTargetLambda(rpm, load);
+	float afr = stoich * lambda;
+	targetLambda = lambda;
+	return airmass / afr;
+}
 ```
 
-## 3. 目标空燃比
+**要点**：`lambdaTable`（3D: RPM × 负荷）决定目标 Lambda；有乙醇传感器时在汽油/E100 化学计量比之间插值。
 
-### 三种运行模式
+### 4.2 运行燃油修正（乘积模型）
 
-| 模式 | AFR目标 | 场景 |
-|------|---------|------|
-| 开环 | 查表 (目标AFR表) | 起动、大负荷、WOT |
-| 闭环 | 14.7:1 (理想值) + 氧传感器反馈 | 巡航、部分负荷 |
-| 加浓 | Lambda < 1.0 | 大负荷冷却、加速补偿 |
-
-### 目标AFR表的含义
-
-`targetLambda` 表（3D: RPM × 负荷）定义了每个工况点的目标Lambda值：
-- 巡航区域: 1.0 (理论空燃比，三效催化器效率最高)
-- 大负荷区域: 0.85-0.90 (浓混合气冷却燃烧室，防止爆震)
-- 减速区域: 1.1+ (稀混合气或断油，省油)
-
-## 4. 燃油修正
-
-### 起动后修正
-
-```c
-// 从起动到正常运行的过渡修正:
-// postCrankingFuelMass.enrichment = f(起动后转数, 水温)
-// 线性衰减: 起动后逐渐减少加浓
-// 水温低时衰减更慢 (冷机需要更多时间建立稳定燃烧)
+```156:196:firmware/controllers/algo/fuel_math.cpp
+float getRunningFuel(float baseFuel) {
+	float correction = baroCorrection * iatCorrection * cltCorrection * postCrankingFuelCorrection;
+	// ... ALS / Launch 修正 ...
+	float runningFuel = baseFuel * correction;
+	return runningFuel;
+}
 ```
 
-### 温度修正
+各修正项在 `periodicFastCallback()` 中提前计算并缓存，修正为**乘积**关系——改变一项不影响其他项的相对权重。
 
-```c
-getCltFuelCorrection():  // 暖机加浓
-  // 查 cltFuelCorr 表 (水温→加浓系数)
-  // 低温 → 大量加浓 (最多可达30%+)
-  // 90°C → 1.0 (无修正)
-  // 高于90°C → 低于1.0 (稀薄，降温和省油)
+### 4.3 闭环修正（STFT）
 
-getIatFuelCorrection():  // 进气温度修正
-  // 修正空气密度变化
-  // 高温 → 减少燃油 (空气稀薄)
-  // 低温 → 增加燃油 (空气密实)
+`ClosedLoopFuelCell::update()` 对 Lambda 误差做积分：
+
+```12:44:firmware/controllers/math/closed_loop_fuel_cell.cpp
+void ClosedLoopFuelCellBase::update(float lambdaDeadband, bool ignoreErrorMagnitude) {
+	float lambdaError = getLambdaError();
+	if (std::abs(lambdaError) < lambdaDeadband) {
+		return;
+	}
+	float adjust = getIntegratorGain() * lambdaError * integrator_dt + m_adjustment;
+	// clamp to [minAdjust, maxAdjust]
+	m_adjustment = adjust;
+}
 ```
 
-### 气压修正
+最终每缸喷油量：`cycleFuelMass × bankTrim × cylinderTrim`（`engine2.cpp` 第 190 行）。
 
-```c
-getBaroCorrection():
-  // 高海拔 → 减少燃油 (空气稀薄)
-  // 参考: 101.325kPa 为 1.0
+### 4.4 减速断油 (DFCO)
+
+状态判定带滞回——中间区域保持上一状态：
+
+```14:74:firmware/controllers/algo/fuel/dfco.cpp
+bool DfcoController::getState() const {
+	// TPS < threshold, CLT > threshold, MAP 可选, 离合器条件
+	bool dfcoAllowed = mapActivate && tpsActivate && cltActivate && clutchActivate;
+	if (dfcoAllowed && rpmHigh && vssHigh) {
+		return true;   // 进入断油
+	}
+	if (!dfcoAllowed || rpmLow || vssLow) {
+		return false;  // 退出断油
+	}
+	return m_isDfco;   // 滞回：保持当前状态
+}
 ```
 
-## 5. 减速断油 (DFCO)
+`cutFuel()` 还检查 `dfcoDelay`，避免 TPS 刚松开就立即断油：
 
-```c
-// 条件:
-// 1. RPM高于阈值 (config->dfcoRpm)
-// 2. TPS关闭 (松油门)
-// 3. RPM在下降 (不是定速下滑)
-// 满足 → 喷油量设为0
-// RPM降到恢复阈值 → 恢复喷油 (防止熄火)
+```91:97:firmware/controllers/algo/fuel/dfco.cpp
+bool DfcoController::cutFuel() const {
+	bool hasBeenDelay = (cutDelay == 0) || m_timeSinceNoCut.hasElapsedSec(cutDelay);
+	return m_isDfco && hasBeenDelay;
+}
 ```
 
-**为什么需要DFCO**: 松油门时发动机被车轮反拖，不需要燃油也能维持运转，停止喷油可以节省大量燃油（现代车辆5-10%的燃油经济性提升来自DFCO）。同时可以降低排气温度。
+### 4.5 喷油脉宽转换
 
-## 6. 加速补偿
-
-### 壁膜补偿
-
-燃油喷射到进气道后，部分燃油沉积在管壁上形成油膜（wall wetting），不会立即进入气缸。加速时：
-1. TPS突然加大 → 进气量突然增加
-2. 如果没有额外补偿 → 混合气瞬时变稀
-3. 开发测试 -> 测量得出的补偿量
-4. 补偿量 = TPS变化率 × 加速加浓系数
-
-### 壁膜模型 (`wall_fuel.cpp`)
-
-```c
-// 模拟燃油在进气道壁面的行为:
-// - 部分燃油撞击壁面并沉积
-// - 沉积燃油随时间蒸发进入气流
-// - 加速或减速时壁膜的变化影响实际进入气缸的燃油量
-// - 通过调整喷油补偿壁膜变化的动态过程
+```167:181:firmware/controllers/algo/fuel/injector_model.cpp
+float InjectorModelBase::getInjectionDuration(float fuelMassGram) const {
+	if (fuelMassGram <= 0) {
+		return 0.0f;
+	}
+	float baseDuration = getBaseDurationImpl(fuelMassGram);
+	baseDuration = std::max(baseDuration, getMinimumPulse());
+	return baseDuration + m_deadtime;
+}
 ```
 
-## 7. 喷油正时
+`prepare()` 在每次快速回调中根据电池电压更新 `m_deadtime`（查 `battLagCorr` 表）。有燃油压力传感器时，流量按 `sqrt(ΔP/Pref)` 修正。
 
-```c
-getInjectionOffset(rpm, load):
-  // 3D查表: RPM×负荷 → 喷油起始角度
-  // 一般在进气门开启前结束喷油
-  // 让燃油有时间雾化并与空气混合
-  // 大负荷可能需要更早喷油 (更多燃油需要更长时间雾化)
+### 4.6 壁膜模型
+
+壁膜在**触发回调**中、调度前修正喷油量：
+
+```105:112:firmware/controllers/engine_cycle/fuel_schedule.cpp
+	auto cycleMassGrams = engine->cylinders[this->cylinderNumber].getInjectionMass();
+	// ...
+	injectionMassGrams = wallFuel.adjust(injectionMassGrams);
 ```
 
-## 8. 喷油脉宽计算
+`WallFuelController::onFastCallback()` 在起动时禁用壁膜（`isCranking()` 时 `m_enable = false`），因为起动油量已单独加浓。
 
-```c
-// 燃油质量 → 喷油器开启时间 (脉宽)
-// 开启时间 = 燃油质量 / (喷油器流量 × 修正系数) + 无效时间
-// 无效时间 (dead time): 喷油器开启和关闭的机械延迟
-// 无效时间随电池电压变化 (电压高→开启快→无效时间短)
+### 4.7 喷油正时
+
+```305:331:firmware/controllers/algo/fuel_math.cpp
+angle_t getInjectionOffset(float rpm, float load) {
+	angle_t value = interpolate3d(config->injectionPhase, config->injPhaseLoadBins, load, config->injPhaseRpmBins, rpm);
+	wrapAngle(result, "inj offset#2", ObdCode::CUSTOM_ERR_6553);
+	return result;
+}
 ```
 
-**为什么无效时间随电压变化**: 喷油器是电磁阀，开启力与电流成正比。电池电压高→线圈电流上升快→喷油器开启快→无效时间短。需要一个电压-无效时间表来修正这个非线性特性。
+`OneCylinder::computeInjectionAngle()` 将"喷油结束角度"反推为"开启角度"：`openingAngle = injectionOffset - injectionDurationAngle`。
+
+---
+
+## 5. 空气量模型对比
+
+| 模型 | 实现 | 适用场景 |
+|------|------|---------|
+| Speed-Density | `MAP × VE × displacement / (R × IAT)` | 标配，成本低 |
+| MAF | 传感器直接测质量流量 | 精度高，对泄漏敏感 |
+| Alpha-N | `alphaNTable(TPS, RPM)` | 高凸轮重叠，MAP 失真 |
+| Lua | 用户脚本 | 自定义 |
+
+---
+
+## 6. 设计权衡
+
+- **计算与调度分离**：250 Hz 算"喷多少"，触发中断按角度"何时喷"——避免在 ISR 中做复杂数学。
+- **乘积修正模型**：各修正项独立，标定一项不影响其他项的相对效果。
+- **DFCO 滞回 + 延迟**：防止 TPS/MAP 边界抖动导致喷油断续；恢复时 `getTimingRetard()` 渐进恢复点火角防止失火。
+- **壁膜在调度层修正**：快速回调输出"理想喷油量"，壁膜在最后一刻调整实际喷射量，更准确反映进气道动态。

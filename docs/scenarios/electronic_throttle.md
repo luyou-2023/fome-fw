@@ -2,149 +2,206 @@
 
 ## 1. 场景描述
 
-驾驶员踩下油门踏板后，ECU需要控制节气门电机将节气门翻板旋转到合适的开度，同时保证安全性和响应速度。
+驾驶员踩下油门后，ECU 控制 H 桥电机驱动节气门翻板到目标开度。这是**安全关键**系统——传感器冗余、卡滞检测、跛行模式均为强制要求。控制频率锁定 **500 Hz**（与 ADC 采样率一致，满足 Nyquist 定理）。
 
-## 2. 核心架构
+---
+
+## 2. 数据流
 
 ```
-驾驶员意图识别
-  ├── 踏板位置传感器 (PPS) 主+副 (冗余)
-  └── 冗余校验 → 错误判定
-  ↓
-目标位置计算
-  ├── 踏板→节气门映射表
-  ├── 扭矩模型
-  ├── 怠速叠加
-  ├── Lua修正
-  └── ETB限速器
-  ↓
-位置控制 (500Hz)
-  ├── 开环前馈 (查表)
-  └── 闭环PID (带自整定)
-  ↓
-H桥电机驱动 → 节气门体 (带冗余位置反馈)
+主循环 500Hz: EtbController::update()
+  ├─ checkStatus()              → TPS/PPS 健康检查，计数 >50 次故障
+  ├─ ClosedLoopController::update()
+  │    ├─ getSetpoint()         → 踏板映射 / 扭矩模型 / 怠速叠加 / 限速
+  │    ├─ observePlant()        → TPS1/TPS2 冗余读数
+  │    ├─ getOpenLoop(target)   → etbBias 前馈表
+  │    ├─ getClosedLoop()       → PID 或 Autotune 继电反馈
+  │    └─ output = openLoop + closedLoop
+  └─ setOutput() → DcMotor::set(duty)
+
+外部输入:
+  ├─ setEtbIdlePosition()       ← IdleController
+  ├─ setEtbWastegatePosition()  ← BoostController
+  └─ setEtbLuaAdjustment()      ← Lua 脚本
 ```
 
-## 3. 冗余设计
+---
 
-### 传感器冗余
+## 3. 调用时序图
 
-```c
-// 每个物理量有两个传感器:
-// 踏板: PPS1 + PPS2 (两个独立电位器)
-// 节气门: TPS1 + TPS2 (两个独立电位器)
-// 
-// 有效性检查:
-// 1. 两个传感器读数必须成比例 (通常TPS2 = TPS1 × 0.5)
-// 2. 偏差超过阈值 → 判定故障
-// 3. 连续故障超过50次 → 进入跛行模式
+```mermaid
+sequenceDiagram
+    participant ML as 主循环 500Hz
+    participant ETB as EtbController
+    participant PPS as 踏板传感器
+    participant TPS as 节气门传感器
+    participant PID as efi_pid
+    participant MOT as DcMotor H桥
+
+    ML->>ETB: update()
+    ETB->>ETB: checkStatus()
+    alt TPS/PPS 连续故障 >50次
+        ETB->>MOT: disable("etb status")
+    else 正常
+        ETB->>PPS: Sensor::get(AcceleratorPedal)
+        ETB->>ETB: getSetpointEtb()
+        Note over ETB: pedalMap(RPM, pedal)<br/>+ idlePosition叠加<br/>+ revLimiter<br/>+ trim
+        ETB->>TPS: observePlant()
+        ETB->>ETB: getOpenLoop(target)
+        Note over ETB: etbBiasBins/Values 前馈
+        alt autotune (RPM=0)
+            ETB->>PID: getClosedLoopAutotune() 继电反馈
+        else 正常
+            ETB->>PID: getOutput(target, observation)
+        end
+        ETB->>MOT: set(ETB_PERCENT_TO_DUTY(openLoop+closedLoop))
+        ETB->>ETB: checkJam(setpoint, observation)
+    end
 ```
 
-**为什么使用主副传感器比例而非绝对相等**: 两个传感器通常使用不同的电压范围（如TPS1=0-5V, TPS2=0-2.5V）。这不仅是冗余，还有助于检测电路故障——如果TPS1和TPS2的比值偏离预期值，说明某个传感器或其电路有问题。
+---
 
-### 跛行策略
+## 4. 关键代码分析
 
-```c
-// 故障时:
-// 1. 断开电机电源
-// 2. 节气门依靠回位弹簧停在"跛行位置" (~15%开度)
-// 3. 限制发动机转速 (~3000RPM)
-// 4. 限制车速 (~30km/h)
-// 目的: 车辆可以低速开到修理厂
+### 4.1 统一闭环框架
+
+ETB、增压、VVT 均继承 `ClosedLoopController`：
+
+```12:43:firmware/controllers/closed_loop_controller.h
+void update() {
+	expected<TOutput> setpoint = getSetpoint();
+	expected<TInput> observation = observePlant();
+	expected<TOutput> openLoopResult = getOpenLoop(setpoint.Value);
+	expected<TOutput> closedLoopResult = getClosedLoop(setpoint.Value, observation.Value);
+	return openLoopResult.Value + closedLoopResult.Value;
+}
 ```
 
-## 4. PID控制详解
+任一步骤失败（传感器无效、setpoint 无法计算）→ `setOutput(unexpected)` → 电机禁用。
 
-### 控制器结构
+### 4.2 目标位置计算
 
-```c
-EtbController::update():
-  → checkStatus()        // 传感器健康检查
-  → getSetpoint()        // 计算目标位置
-  → getOpenLoop()        // 前馈 (etbBiasBins/etbBiasValues)
-  → getClosedLoop()      // PID反馈
-  → setOutput(openLoop + closedLoop)  // 输出占空比
+```272:336:firmware/controllers/actuators/electronic_throttle.cpp
+expected<percent_t> EtbController::getSetpointEtb() {
+	auto pedalPosition = Sensor::get(SensorType::AcceleratorPedal);
+	float pedalTableValue = m_pedalMap->getValue(rpm, sanitizedPedal);
+
+	float targetPosition = engineConfiguration->enableTorqueModel
+		? getSetpointEtbTorqueModel(pedalTableValue)
+		: getSetpointEtbNonTorqueModel(pedalTableValue);
+
+	targetPosition += getThrottleTrim(rpm, targetPosition);  // ±10% clamp
+	targetPosition = clampF(0, targetPosition, 100);
+
+	// ETB rev limiter: RPM > etbRevLimitStart 时线性关小节气门
+	targetPosition = interpolateClamped(etbRpmLimit, targetPosition, fullyLimitedRpm, 0, rpm);
+	return targetPosition;
+}
 ```
 
-### 前馈计算
+非扭矩模式的怠速叠加：
 
-```c
-getOpenLoop(target):
-  // 查 etbBiasBins/etbBiasValues 表
-  // 目标位置→所需占空比
-  // 克服: 回位弹簧 + 气流力
-  // 例如: 目标10% → 占空比15% (需要驱动电机抵抗弹簧关闭力)
-  //       目标50% → 占空比40% (气流力和弹簧力接近平衡)
-  //       目标90% → 占空比70% (需要驱动电机抵抗弹簧打开力)
+```339:358:firmware/controllers/actuators/electronic_throttle.cpp
+percent_t EtbController::getSetpointEtbNonTorqueModel(percent_t pedalTableValue) const {
+	percent_t etbIdleAddition = PERCENT_DIV * etbIdleThrottleRange * m_idlePosition;
+	// [0,100] 踏板表值 → [idle, 100] 实际目标
+	return interpolateClamped(0, etbIdleAddition, 100, 100, pedalTableValue) + getLuaAdjustment();
+}
 ```
 
-**为什么前馈不是线性关系**: 节气门翻板在气流中受到复杂的气动力。在低开度时，气流速度高，吸力大（类似文丘里效应），需要更多占空比。中开度时气动力和弹簧力平衡，所需占空比小。大开度时弹簧力再次主导。
+**要点**：`etbIdleThrottleRange` 压缩踏板行程——怠速区域占全行程的一部分，踏板从 0% 开始对应 idle 位置而非全关。
 
-### PID参数自整定
+### 4.3 前馈（非线性补偿）
 
-```c
-getClosedLoopAutotune(target, actual):
-  // Åström-Hägglund 继电反馈:
-  // 1. 在目标附近做±Δ的开关控制 (bang-bang)
-  // 2. 测量振荡幅度(A)和周期(T_u)
-  // 3. 计算: K_u = 4Δ / (πA), T_u = 振荡周期
-  // 4. Ziegler-Nichols: Kp = 0.6K_u, Ki = Kp/(0.5T_u), Kd = Kp/(0.125T_u)
+```392:402:firmware/controllers/actuators/electronic_throttle.cpp
+expected<percent_t> EtbController::getOpenLoop(percent_t target) {
+	if (m_function != DC_Wastegate) {
+		feedForward = interpolate2d(target, config->etbBiasBins, config->etbBiasValues);
+	}
+	return feedForward;
+}
 ```
 
-**为什么选择继电反馈而非其他方法**: 继电反馈自动在系统临界稳定点振荡，直接测量极限增益和周期。不需要工程师具备控制理论知识，也不需要测功机或特殊设备。在整定过程中节气门可以保持在目标位置附近，不影响发动机基本运行。
+前馈非线性原因：低开度时文丘里效应吸力大，需更高占空比；中开度气动力与弹簧平衡；大开度弹簧力主导。
 
-## 5. 扭矩模型
+### 4.4 PID 闭环与卡滞检测
 
-### 非扭矩模式
-
-```c
-getSetpointEtbNonTorqueModel():
-  // 直接踏板位置→节气门位置映射
-  // 目标位置 = pedalMap(rpm, pedalPosition)
-  // + idlePosition (怠速叠加，压缩踏板行程范围)
-  // + LuaAdjustment
-  // 简单直接
+```492:510:firmware/controllers/actuators/electronic_throttle.cpp
+expected<percent_t> EtbController::getClosedLoop(percent_t target, percent_t observation) {
+	if (m_isAutotune) {
+		return getClosedLoopAutotune(target, observation);
+	}
+	checkJam(target, observation);
+	m_error = target - observation;
+	return m_pid.getOutput(target, observation, etbPeriodSeconds);
+}
 ```
 
-### 扭矩模式
+卡滞检测：`absError > etbJamDetectThreshold` 持续 `etbJamTimeout` 秒 → 报告 ETB 故障 → LimpManager 限制节气门。
 
-```c
-getSetpointEtbTorqueModel():
-  // 1. 扭矩模型计算"驾驶员请求扭矩"
-  // 2. 转换为"进气需求"
-  // 3. 再转换为节气门位置
-  // 踏板位置 → 扭矩请求 → 进气请求 → 节气门位置
-  // 踏板不再直接控制节气门，而是表示"要多少扭矩"
-  // 优势: 可精确控制加速特性
+### 4.5 传感器冗余校验
+
+```533:596:firmware/controllers/actuators/electronic_throttle.cpp
+bool EtbController::checkStatus() {
+	if (isTpsError && !hadTpsError) { etbTpsErrorCounter++; }
+	if (isPpsError && !hadPpsError) { etbPpsErrorCounter++; }
+	if (etbTpsErrorCounter > 50) { localReason = TpsState::IntermittentTps; }
+	if (etbPpsErrorCounter > 50) { localReason = TpsState::IntermittentPps; }
+	return localReason == TpsState::None;
+}
 ```
 
-**扭矩模型的价值**: 在非扭矩模式下，踏板→节气门→扭矩关系是非线性的（受RPM、IAT、海拔等影响）。在扭矩模式下，ECU主动控制扭矩输出，不论外部条件如何，相同的踏板位置都产生相同的车辆加速响应，给驾驶员一致的驾驶感受。
+主副传感器通常成比例（TPS2 ≈ TPS1 × 0.5）——比值偏离预期说明电路故障，而非简单的"读数不等"。
 
-## 6. 与怠速控制的交互
+### 4.6 PID 自整定（Åström-Hägglund）
 
-```c
-setEtbIdlePosition(position):
-  // 怠速控制器设置额外开度
-  // ETB控制器将怠速位置叠加到踏板映射上
-  // 实现: 踏板在整个可调范围内压缩
-  // 目标 = (100% - idleThrottleRange) × pedalMap + idlePosition
-  // idleThrottleRange = 怠速区域占全行程的比例
+```405:447:firmware/controllers/actuators/electronic_throttle.cpp
+expected<percent_t> EtbController::getClosedLoopAutotune(percent_t target, percent_t actualThrottlePosition) {
+	// Bang-bang: 目标附近 ±20% 开关控制，诱导振荡
+	return autotuneAmplitude * (actualThrottlePosition > target ? -1 : 1);
+	// 每个周期记录振幅 A 和周期 T_u
+	// K_u = 4b / (πA),  Z-N: Kp=0.35Ku, Ki=0.25Ku/Tu, Kd=0.08Ku×Tu
+}
 ```
 
-## 7. ETB限速器
+仅在 **RPM = 0** 且 `etbAutoTune` 开启时运行——避免行驶中振荡。
 
-```c
-// RPM超过 etbRevLimitStart 后:
-// 线性减小节气门开度
-// 在 RPM = etbRevLimitStart + etbRevLimitRange 时关闭
-// 比燃油断油更平滑的限速方式
+### 4.7 扭矩模式
+
+```361:366:firmware/controllers/actuators/electronic_throttle.cpp
+percent_t EtbController::getSetpointEtbTorqueModel(percent_t pedalTableValue) const {
+	percent_t torqueModelThrottle = engine->module<TorqueModel>()->getThrottleRequest();
+	return std::min(torqueModelThrottle, pedalTableValue);  // 踏板表作为安全上限
+}
 ```
 
-## 8. 常见问题
+踏板表示"扭矩请求"而非"节气门位置"——ECU 根据 RPM/IAT/海拔计算所需节气门开度，相同踏板产生一致的加速响应。
+
+---
+
+## 5. 与怠速/增压的交互
+
+| 来源 | 接口 | 作用 |
+|------|------|------|
+| IdleController | `setEtbIdlePosition(pos)` | 怠速时额外开度 |
+| BoostController | `setEtbWastegatePosition(duty)` | ETB 型废气旁通阀 |
+| Lua | `setEtbLuaAdjustment(±%)` | 0.2s 超时自动失效 |
+
+---
+
+## 6. 常见问题
 
 | 问题 | 原因 | 解决方案 |
 |------|------|---------|
-| 节气门振荡 | PID参数不当，积分过强 | 执行自整定或手动减小Ki |
-| 响应迟滞 | Kp过小，前馈不准 | 校准etbBias表，增大Kp |
-| 怠速不稳(ETB车型) | 怠速叠加策略不当 | 调整etbIdleThrottleRange |
-| 加速窜动 | 踏板→节气门映射过陡 | 调整pedalToTpsTable曲线 |
+| 节气门振荡 | Ki 过大 | 自整定或减小 Ki |
+| 响应迟滞 | Kp 过小 / 前馈不准 | 校准 etbBias 表 |
+| 怠速不稳 | idle 叠加不当 | 调整 etbIdleThrottleRange |
+| 加速窜动 | 踏板映射过陡 | 调整 pedalToTpsTable |
+
+---
+
+## 7. 设计权衡
+
+- **500 Hz 固定频率**：安全关键系统不允许用户修改更新率；与 ADC 同步避免采样混叠。
+- **踏板失效时用 0% 而非禁用 ETB**：比完全失去节气门控制更安全——至少能关小节气门让发动机怠速。
+- **Lua 调整 0.2s 超时**：防止脚本卡死导致节气门 stuck open。
